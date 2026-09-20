@@ -1,7 +1,8 @@
 import type {
-  MetaState, RunState, PlayerState, MapNode, RewardOffer, Scene, SceneChoice,
+  MetaState, RunState, PlayerState, RewardOffer, Scene, SceneChoice,
   RunReport, RewriteDef, KnowledgeId, EndingId, LogEntry, WorldDelta,
 } from "../types.js";
+import type { Floor, DungeonEntity } from "../dungeon/types.js";
 import { Rng } from "../rng.js";
 import { SKILLS, getSkill, activeSynergies, synergyHintFor, SYNERGIES } from "../content/skills.js";
 import { ITEMS, getItem, NPC_BY_ID, ENDINGS, WORLD_TRUTHS } from "../content/world.js";
@@ -11,14 +12,23 @@ import {
   grantKnowledge, knows, invalidate, rollStructural, applyDistortionDecay,
   runSynthesis, reliabilityOf, type Acquisition,
 } from "./knowledge.js";
-import { generateMap, PURGE_NODE } from "./map.js";
+import { generateFloor, revealRoom } from "../dungeon/generate.js";
 import {
-  startCombat, playerAction, combatRewards, refreshSpecials,
+  computeVisibility, lightRadiusFor, stepPlayer, monsterTurn, findPath,
+  type MoveOutcome,
+} from "../dungeon/runtime.js";
+import { DUNGEON_DEPTH, stratumFor, entityAt, idx } from "../dungeon/types.js";
+import {
+  startCombat, playerAction, combatRewards,
   type CombatContext, type PlayerAction, type ActionResult,
 } from "./combat.js";
 
 export const RUN_START_CLOCK = 6 * 60;
 export const RUN_DEADLINE = 24 * 60;
+/** Every step underground costs time.  The clock is the exploration budget. */
+export const STEP_MINUTES = 1;
+export const DESCEND_MINUTES = 10;
+export const VILLAGE_ACTION_BUDGET = 3;
 
 const XP_TABLE = [0, 25, 60, 110, 175, 255, 350];
 
@@ -38,6 +48,27 @@ export function clockString(min: number): string {
 
 function log(run: RunState, text: string, kind: LogEntry["kind"] = "info"): void {
   run.log.push({ clock: run.clock, text, kind });
+}
+
+function rngFor(run: RunState, tag: string): Rng {
+  return new Rng(`${run.seed}:${tag}:${run.depth}:${run.clock}:${run.floorSteps}`);
+}
+
+function ctxFor(meta: MetaState, run: RunState, tag: string): CombatContext {
+  return { meta, run, rng: rngFor(run, tag) };
+}
+
+function lightRadius(run: RunState): number {
+  return lightRadiusFor(run.player.items.includes("I_TORCH"), run.player.skills.includes("S07"));
+}
+
+/** Everything the rest of the engine needs to know about "where you are". */
+export function currentPlace(run: RunState): { name: string; region: string; depth: number; npcId?: string } {
+  const s = stratumFor(run.depth);
+  const npc = run.floor.entities.find(
+    (e) => e.kind === "npc" && Math.abs(e.x - run.px) <= 1 && Math.abs(e.y - run.py) <= 1,
+  );
+  return { name: `B${run.depth}F ${s.title}`, region: s.region, depth: run.depth, npcId: npc?.npcId };
 }
 
 // ------------------------------------------------------------------- run start
@@ -63,8 +94,9 @@ export function startRun(meta: MetaState, seed: string): RunState {
     runNumber: meta.totalRuns, seed,
     clock: RUN_START_CLOCK,
     player,
-    map: generateMap({ meta, rng: rng.fork("map"), liveKnowledge, regionDanger: {}, bossId }),
-    step: 0, currentNodeId: "NODE_VILLAGE", visited: [],
+    floor: null as unknown as Floor,
+    depth: 1, px: 0, py: 0, bossId,
+    floorsVisited: [], floorSteps: 0,
     npcTrust: {}, npcFlags: {}, deadNpcs: [], suspicion: 0,
     activeSynergies: activeSynergies(starters).map((s) => s.id),
     worldDeltas: [], knowledgeGainedThisRun: [], synthesizedThisRun: [], firstSeenThisRun: [],
@@ -73,28 +105,52 @@ export function startRun(meta: MetaState, seed: string): RunState {
     regionDanger: {}, freeActionsLeft: 3, routeUnlocks: [],
   };
 
-  // Archivist's Loop promotes one shaky fact at the start of every run.
+  run.floor = buildFloor(meta, run, 1, liveKnowledge);
+  placeOnEntry(run);
+
   if (player.skills.includes("S20")) {
     const shaky = Object.values(meta.knowledge).find((k) => k.reliability === "uncertain");
     if (shaky) { shaky.reliability = "confirmed"; log(run, `記録の環: ${getKnowledge(shaky.id).title} が Confirmed になった`, "knowledge"); }
   }
 
-  log(run, `RUN ${run.runNumber} — 村アシュメア`, "info");
+  log(run, `RUN ${run.runNumber} — 村アシュメア、井戸の前`, "info");
   run.pendingScene = villageScene(meta, run);
   return run;
 }
 
-export function rngFor(run: RunState, tag: string): Rng {
-  return new Rng(`${run.seed}:${tag}:${run.clock}:${run.visited.length}`);
+function buildFloor(meta: MetaState, run: RunState, depth: number, live: Set<KnowledgeId>): Floor {
+  const floor = generateFloor({
+    depth,
+    rng: new Rng(`${run.seed}:floor:${depth}:${run.worldDeltas.length}`),
+    meta,
+    liveKnowledge: live,
+    takenThisRun: new Set(run.knowledgeGainedThisRun),
+    bossId: run.bossId,
+    regionDanger: run.regionDanger,
+  });
+  const s = stratumFor(depth);
+  if (!run.floorsVisited.includes(`B${depth}F ${s.title}`)) {
+    run.floorsVisited.push(`B${depth}F ${s.title}`);
+  }
+  if (!meta.firstSeenLocations.includes(s.region)) {
+    meta.firstSeenLocations.push(s.region);
+    run.firstSeenThisRun.push(`B${depth}F ${s.title}`);
+  }
+  return floor;
 }
 
-function ctxFor(meta: MetaState, run: RunState, tag: string): CombatContext {
-  return { meta, run, rng: rngFor(run, tag) };
+function placeOnEntry(run: RunState): void {
+  run.px = run.floor.entry.x;
+  run.py = run.floor.entry.y;
+  run.floorSteps = 0;
+  computeVisibility(run.floor, run.px, run.py, lightRadius(run));
 }
 
-// ------------------------------------------------------------------- village
-export const VILLAGE_ACTION_BUDGET = 3;
+function liveKnowledgeFor(meta: MetaState, run: RunState): Set<KnowledgeId> {
+  return rollStructural(meta, new Rng(`${run.seed}:structural:${run.depth}`));
+}
 
+// ------------------------------------------------------------------- surface
 function villageScene(meta: MetaState, run: RunState): Scene {
   const left = VILLAGE_ACTION_BUDGET - (run.player.flags["villageActions"] ?? 0);
   const choices: SceneChoice[] = [];
@@ -105,15 +161,16 @@ function villageScene(meta: MetaState, run: RunState): Scene {
       { actionId: "VILLAGE_SHOP", label: `買い物をする（0h）  あと ${left} 回` },
     );
   }
-  choices.push({ actionId: "VILLAGE_LEAVE", label: "村を出る" });
+  choices.push({ actionId: "VILLAGE_LEAVE", label: "▼ 井戸を降りる" });
   for (const rw of availableRewrites(meta, run)) {
     choices.unshift({ actionId: `REWRITE:${rw.id}`, label: `▶ REWRITE — ${rw.title}` });
   }
   return {
-    nodeId: "NODE_VILLAGE", title: "村アシュメア",
+    nodeId: "SURFACE",
+    title: "村アシュメア — 灰の迷宮 入口",
     narrative: run.runNumber === 1
-      ? "霧の薄い朝。宿の窓から灯りが漏れている。今日という日は、まだ何も決まっていない。"
-      : `${run.runNumber} 度目の朝。同じ霧、同じ灯り。違うのは、あなたが知っていることだけだ。`,
+      ? "井戸の底から風が上がってくる。誰かが掘ったにしては、深すぎる。"
+      : `${run.runNumber} 度目の朝。同じ井戸、同じ風。違うのは、あなたが知っていることだけだ。`,
     speaker: "N01", dialogue: dejaVuLine(meta, "N01"),
     choices, allowFreeAction: true,
   };
@@ -144,10 +201,6 @@ export function availableRewrites(meta: MetaState, run: RunState): RewriteDef[] 
   });
 }
 
-/**
- * Apply a REWRITE.  Every consequence here is authored in data — the LLM gets
- * to narrate this, never to decide it (DESIGN §15).
- */
 export function applyRewrite(meta: MetaState, run: RunState, rewriteId: string): {
   delta: WorldDelta; invalidated: KnowledgeId[]; lines: string[];
 } {
@@ -155,25 +208,24 @@ export function applyRewrite(meta: MetaState, run: RunState, rewriteId: string):
   if (!rw) throw new Error(`unknown rewrite ${rewriteId}`);
   const lines: string[] = [];
   const invalidated: KnowledgeId[] = [];
-  let regenerate = false;
+  let reshape = false;
 
   const cost = run.player.skills.includes("S20") ? Math.max(0, rw.timeCost - 60) : rw.timeCost;
-  run.clock += cost;
+  spendTime(meta, run, cost, lines);
 
   for (const eff of rw.effects) {
     switch (eff.kind) {
       case "cancelScheduledEvent":
-        lines.push(`予定されていた出来事が消滅した（${eff.eventId}）`); regenerate = true; break;
+        lines.push("予定されていた出来事が消滅した"); reshape = true; break;
       case "npcFlag":
         (run.npcFlags[eff.npc] ??= []).push(eff.flag); break;
-      case "injectNode": {
-        regenerate = true;
+      case "injectNode":
+        reshape = true;
         run.npcFlags["__inject"] = [...(run.npcFlags["__inject"] ?? []), eff.nodeId];
-        lines.push("本来存在しなかった出来事が発生しようとしている"); break;
-      }
+        lines.push("本来存在しなかった出来事が、下の階で起きようとしている"); break;
       case "removeNode":
         run.npcFlags["__remove"] = [...(run.npcFlags["__remove"] ?? []), eff.nodeId];
-        regenerate = true; break;
+        reshape = true; break;
       case "invalidate": {
         const hit = invalidate(meta, eff.knowledge, rw.id);
         invalidated.push(...hit);
@@ -186,15 +238,15 @@ export function applyRewrite(meta: MetaState, run: RunState, rewriteId: string):
         run.suspicion += run.player.items.includes("I_FALSECREST") ? Math.ceil(eff.delta / 2) : eff.delta; break;
       case "distortion":
         meta.distortion += eff.delta;
-        if (meta.distortion >= 5 && !meta.knowledge["K019"]) grantKnowledge(meta, run, "K019");
+        if (meta.distortion >= 3 && !meta.knowledge["K019"]) grantKnowledge(meta, run, "K019");
         break;
       case "swapBoss":
-        run.bossOverride = eff.to; run.map.bossId = eff.to;
-        lines.push(`対決すべき相手が変わった: ${getBoss(eff.to).jp}`); break;
+        run.bossId = eff.to;
+        lines.push(`最下層で待つ者が変わった: ${getBoss(eff.to).jp}`); break;
       case "dangerShift":
         run.regionDanger[eff.region] = (run.regionDanger[eff.region] ?? 0) + eff.delta;
         lines.push(`${eff.region} の危険度 ${eff.delta > 0 ? "+" : ""}${eff.delta}`);
-        regenerate = true; break;
+        reshape = true; break;
       case "grantItem":
         run.player.items.push(eff.item); lines.push(`${getItem(eff.item).jp} を手に入れた`); break;
       case "unlockRoute":
@@ -203,6 +255,9 @@ export function applyRewrite(meta: MetaState, run: RunState, rewriteId: string):
         run.player.flags["ally"] = 1; lines.push("次の戦闘に味方が加わる"); break;
       case "killNpc":
         run.deadNpcs.push(eff.npc);
+        for (const e of run.floor.entities) {
+          if (e.kind === "npc" && e.npcId === eff.npc) e.used = true;
+        }
         lines.push(`${NPC_BY_ID.get(eff.npc)?.jp ?? eff.npc} はもういない`); break;
     }
   }
@@ -216,147 +271,242 @@ export function applyRewrite(meta: MetaState, run: RunState, rewriteId: string):
   log(run, `REWRITE: ${rw.title}`, "rewrite");
   for (const l of lines) log(run, l, "rewrite");
 
-  if (regenerate) regenerateFrom(meta, run, Math.max(1, run.step + 1));
+  // Changing history re-shapes the floors you have not reached yet.
+  if (reshape) {
+    run.player.flags["reshaped"] = 1;
+    lines.push("この先の階層の形が変わった。");
+  }
   return { delta, invalidated, lines };
 }
 
-/** The world re-plans itself from the current step onward. */
-function regenerateFrom(meta: MetaState, run: RunState, fromStep: number): void {
-  const rng = new Rng(`${run.seed}:regen:${run.worldDeltas.length}`);
-  const live = rollStructural(meta, rng.fork("structural"));
-  const fresh = generateMap({
-    meta, rng: rng.fork("map"), liveKnowledge: live,
-    regionDanger: run.regionDanger, bossId: run.map.bossId,
-  });
-  const remove = new Set(run.npcFlags["__remove"] ?? []);
-  const inject = run.npcFlags["__inject"] ?? [];
-
-  for (let s = fromStep; s < run.map.steps.length - 1; s++) {
-    let nodes = (fresh.steps[s] ?? []).filter((n) => !remove.has(n.id));
-    if (inject.includes("NODE_PURGE") && s === 4) {
-      nodes = [{ ...PURGE_NODE, step: s }, ...nodes.slice(0, 2)];
-    }
-    if (inject.includes("NODE_CHURCH_UNDER") && s === 4 && !nodes.some((n) => n.id === "NODE_CHURCH_UNDER")) {
-      nodes = [...nodes.slice(0, 2), {
-        id: "NODE_CHURCH_UNDER", kind: "discovery", name: "教会・地下書庫", region: "church",
-        act: 2, step: s, danger: 1, timeCost: 120, tags: ["church", "secret"],
-        hints: ["Knowledge 確定"], knowledgeId: meta.knowledge["K016"] ? undefined : "K016",
-      }];
-    }
-    if (nodes.length === 0) nodes = fresh.steps[s] ?? [];
-    run.map.steps[s] = nodes;
-  }
-}
-
 // ------------------------------------------------------------------- movement
-export function nodeOptions(run: RunState): MapNode[] {
-  if (run.step + 1 >= run.map.steps.length) return run.map.steps[run.map.steps.length - 1]!;
-  return run.map.steps[run.step + 1] ?? [];
-}
-
-export interface EnterResult {
-  scene?: Scene;
-  combatStarted?: boolean;
-  acquisitions?: Acquisition[];
-  reward?: RewardOffer;
+export interface StepResult {
   lines: string[];
+  acquisitions: Acquisition[];
+  combatStarted?: boolean;
+  sceneOpened?: boolean;
+  descended?: boolean;
+  blocked?: boolean;
 }
 
-export function enterNode(meta: MetaState, run: RunState, nodeId: string): EnterResult {
-  const node = nodeOptions(run).find((n) => n.id === nodeId);
-  if (!node) return { lines: ["そのノードへは行けない"] };
-  const lines: string[] = [];
-
-  run.step += 1;
-  run.currentNodeId = node.id;
-  run.visited.push(node.id);
-
-  let time = node.timeCost;
-  if (run.player.items.includes("I_ASHWATCH")) time = Math.max(30, time - 30);
-  if (run.player.skills.includes("S17") && run.player.flags["echoStepUsed"] !== 1 && time >= 120) {
-    run.player.flags["echoStepUsed"] = 1; time = Math.max(30, time - 120);
-    lines.push("残響歩法: 移動時間を 2h 短縮した");
-  }
-  if (run.player.skills.includes("S09") && (node.kind === "discovery" || node.kind === "ashdoor")) {
-    time = 0; lines.push("記録者: この寄り道に時間はかからなかった");
-  }
-  run.clock += time;
-
-  if (!meta.firstSeenLocations.includes(node.region)) {
-    meta.firstSeenLocations.push(node.region);
-    run.firstSeenThisRun.push(node.name);
-  } else if (!run.firstSeenThisRun.includes(node.name) && node.tags.includes("secret")) {
-    run.firstSeenThisRun.push(node.name);
+/** One step in a compass direction.  Bumping into something is how you use it. */
+export function move(meta: MetaState, run: RunState, dx: number, dy: number): StepResult {
+  const out: StepResult = { lines: [], acquisitions: [] };
+  if (run.outcome !== "running" || run.combat || run.pendingScene || run.pendingReward) {
+    out.blocked = true;
+    return out;
   }
 
-  // Exploration is a real progression path, not a detour off the power curve.
-  if (node.kind !== "combat" && node.kind !== "elite" && node.kind !== "boss" && node.kind !== "hub") {
-    gainXp(run, node.kind === "ashdoor" ? 14 : node.kind === "discovery" ? 10 : 8);
-  }
+  const res = stepPlayer(run.floor, run.px, run.py, dx, dy);
+  const o: MoveOutcome = res.outcome;
 
-  log(run, node.name, "info");
-  if (node.convertedBy) {
-    lines.push(`Knowledge により戦闘を回避: ${getKnowledge(node.convertedBy).title}`);
-    log(run, lines[lines.length - 1]!, "knowledge");
-  }
+  if (o.kind === "blocked") { out.blocked = true; return out; }
 
-  // The well shortcut eats a whole step of the castle approach.
-  if (node.tags.includes("shortcut")) {
-    run.step += 1;
-    lines.push("井戸の底から城へ。ひとつ手前の関門を飛ばした（2h 節約）");
+  if (o.kind === "encounter") {
+    run.px = res.x; run.py = res.y;
+    startEncounter(meta, run, o.entity, true, out);
+    return out;
   }
-
-  if (node.kind === "boss" || run.step >= run.map.steps.length - 1) {
-    return { ...startBoss(meta, run), lines };
-  }
-
-  switch (node.kind) {
-    case "combat":
-    case "elite": {
-      const ctx = ctxFor(meta, run, "combat");
-      run.combat = startCombat(ctx, { enemyIds: node.enemyIds ?? ["E_DOG"] });
-      return { combatStarted: true, lines };
+  if (o.kind === "npc") {
+    // Someone you are done with must not be able to wall off a corridor:
+    // walk through them instead.
+    if (o.entity.used || run.deadNpcs.includes(o.entity.npcId ?? "")) {
+      const tx = run.px + dx, ty = run.py + dy;
+      o.entity.x = run.px; o.entity.y = run.py;
+      run.px = tx; run.py = ty;
+      out.lines.push(`${o.entity.name}とすれ違った。`);
+      run.floorSteps += 1;
+      advanceClock(meta, run, STEP_MINUTES, out);
+      if (run.outcome !== "running") return out;
+      computeVisibility(run.floor, run.px, run.py, lightRadius(run));
+      const mt2 = monsterTurn(run.floor, run.px, run.py, rngFor(run, "monsters"));
+      out.lines.push(...mt2.lines);
+      if (mt2.ambushedBy) startEncounter(meta, run, mt2.ambushedBy, false, out);
+      return out;
     }
-    default: {
-      const r = buildScene(meta, run, node);
-      run.pendingScene = r.scene ?? null;
-      return { ...r, lines: [...lines, ...r.lines] };
+    openNpcScene(meta, run, o.entity, out);
+    return out;
+  }
+
+  run.px = res.x; run.py = res.y;
+  run.floorSteps += 1;
+  advanceClock(meta, run, STEP_MINUTES, out);
+  if (run.outcome !== "running") return out;
+
+  if (o.kind === "item") {
+    run.player.items.push(o.entity.itemId!);
+    applyRelic(run, o.entity.itemId!);
+    run.floor.entities = run.floor.entities.filter((e) => e.uid !== o.entity.uid);
+    out.lines.push(`${getItem(o.entity.itemId!).jp} を拾った`);
+    log(run, out.lines[out.lines.length - 1]!, "reward");
+  }
+  if (o.kind === "feature") {
+    openFeatureScene(meta, run, o.entity, out);
+    if (out.sceneOpened) { computeVisibility(run.floor, run.px, run.py, lightRadius(run)); return out; }
+  }
+
+  computeVisibility(run.floor, run.px, run.py, lightRadius(run));
+  const mt = monsterTurn(run.floor, run.px, run.py, rngFor(run, "monsters"));
+  out.lines.push(...mt.lines);
+  if (mt.ambushedBy) startEncounter(meta, run, mt.ambushedBy, false, out);
+  return out;
+}
+
+/** Walk toward a tile, stopping the moment anything interesting happens. */
+export function travelTo(meta: MetaState, run: RunState, tx: number, ty: number, maxSteps = 60): StepResult {
+  const merged: StepResult = { lines: [], acquisitions: [] };
+  for (let i = 0; i < maxSteps; i++) {
+    if (run.outcome !== "running" || run.combat || run.pendingScene || run.pendingReward) break;
+    if (run.px === tx && run.py === ty) break;
+    // Prefer a route around monsters, but a sleeping body in a one-tile
+    // corridor is a door, not a wall: fall back to a path that goes through it
+    // so the player can walk up and engage.
+    const path = findPath(run.floor, { x: run.px, y: run.py }, { x: tx, y: ty }, {
+      blockedBy: (e) => e.kind === "enemy",
+    }) ?? findPath(run.floor, { x: run.px, y: run.py }, { x: tx, y: ty });
+    const next = path?.[0];
+    if (!next) break;
+    // Stop rather than stroll into a NEW monster's reach: whether to engage is
+    // the player's call.  Something already breathing down your neck is not a
+    // reason to refuse to move — walking away from it is a legitimate choice.
+    const targetTile = next.x === tx && next.y === ty;
+    const newThreat = run.floor.entities.some((e) => {
+      if (e.kind !== "enemy" || !e.awake) return false;
+      const nearNext = Math.max(Math.abs(e.x - next.x), Math.abs(e.y - next.y)) <= 1;
+      const nearNow = Math.max(Math.abs(e.x - run.px), Math.abs(e.y - run.py)) <= 1;
+      return nearNext && !nearNow;
+    });
+    // Only halt a journey already in progress.  Refusing the very first step
+    // would deadlock travel whenever a monster stands between you and the goal.
+    if (!targetTile && newThreat && i > 0) break;
+    const r = move(meta, run, next.x - run.px, next.y - run.py);
+    merged.lines.push(...r.lines);
+    merged.acquisitions.push(...r.acquisitions);
+    merged.combatStarted ||= r.combatStarted;
+    merged.sceneOpened ||= r.sceneOpened;
+    merged.descended ||= r.descended;
+    if (r.blocked || r.combatStarted || r.sceneOpened) break;
+    // stop next to an awake monster rather than walking past it
+    if (run.floor.entities.some((e) => e.kind === "enemy" && e.awake
+      && Math.max(Math.abs(e.x - run.px), Math.abs(e.y - run.py)) <= 1)) break;
+  }
+  return merged;
+}
+
+/** Re-open whatever you are standing on.  Walking onto a tile opens it once;
+ *  this is how you get back to it without stepping off and back on. */
+export function interactHere(meta: MetaState, run: RunState): StepResult {
+  const out: StepResult = { lines: [], acquisitions: [] };
+  if (run.outcome !== "running" || run.combat || run.pendingScene || run.pendingReward) {
+    out.blocked = true;
+    return out;
+  }
+  const e = entityAt(run.floor, run.px, run.py);
+  if (!e) { out.blocked = true; out.lines.push("ここには何もない。"); return out; }
+  if (e.kind === "feature") openFeatureScene(meta, run, e, out);
+  else if (e.kind === "npc") openNpcScene(meta, run, e, out);
+  else out.blocked = true;
+  return out;
+}
+
+/** Standing still costs the same as a step; useful for letting a monster come to you. */
+export function wait(meta: MetaState, run: RunState): StepResult {
+  const out: StepResult = { lines: [], acquisitions: [] };
+  if (run.outcome !== "running" || run.combat || run.pendingScene) { out.blocked = true; return out; }
+  run.floorSteps += 1;
+  advanceClock(meta, run, STEP_MINUTES, out);
+  if (run.outcome !== "running") return out;
+  computeVisibility(run.floor, run.px, run.py, lightRadius(run));
+  const mt = monsterTurn(run.floor, run.px, run.py, rngFor(run, "wait"));
+  out.lines.push(...mt.lines);
+  if (mt.ambushedBy) startEncounter(meta, run, mt.ambushedBy, false, out);
+  return out;
+}
+
+/**
+ * The clock is the real hit-point bar of a run.  Past midnight the ash starts
+ * falling and it does not care about Guard — you are meant to be on your way
+ * down, not sweeping every room.
+ */
+export function spendTime(meta: MetaState, run: RunState, minutes: number, lines: string[]): void {
+  run.clock += minutes;
+  if (run.clock <= RUN_DEADLINE) return;
+
+  const over = run.clock - RUN_DEADLINE;
+  if (run.player.flags["ashWarned"] !== 1) {
+    run.player.flags["ashWarned"] = 1;
+    lines.push("日付が変わった。天井から灰が落ちはじめる。");
+    log(run, "灰が降りはじめた", "danger");
+  }
+  const tick = Math.max(1, Math.ceil(minutes / 2)) * (1 + Math.floor(over / 60));
+  run.player.hp -= tick;
+  lines.push(`灰が肌を焼く（${tick}）`);
+  if (run.player.hp <= 0) run.player.hp = 0;
+}
+
+function advanceClock(meta: MetaState, run: RunState, minutes: number, out: StepResult): void {
+  run.clock += minutes;
+  if (run.clock <= RUN_DEADLINE) return;
+
+  const over = run.clock - RUN_DEADLINE;
+  if (run.player.flags["ashWarned"] !== 1) {
+    run.player.flags["ashWarned"] = 1;
+    out.lines.push("日付が変わった。天井から灰が落ちはじめる。");
+    log(run, "灰が降りはじめた", "danger");
+  }
+  const tick = 1 + Math.floor(over / 30);
+  run.player.hp -= tick;
+  out.lines.push(`灰が肌を焼く（${tick}）`);
+  if (run.player.hp <= 0) {
+    run.player.hp = 0;
+    out.acquisitions.push(...onDeath(meta, run, "灰に呑まれた"));
+  }
+}
+
+export function descend(meta: MetaState, run: RunState, skip = 1): StepResult {
+  const out: StepResult = { lines: [], acquisitions: [] };
+  run.pendingScene = null;
+  const next = Math.min(DUNGEON_DEPTH, run.depth + skip);
+  run.depth = next;
+  spendTime(meta, run, DESCEND_MINUTES, out.lines);
+  run.floor = buildFloor(meta, run, next, liveKnowledgeFor(meta, run));
+  placeOnEntry(run);
+  out.descended = true;
+  out.lines.push(`B${next}F ${stratumFor(next).title} へ降りた`);
+  log(run, out.lines[out.lines.length - 1]!, "info");
+  if (next >= DUNGEON_DEPTH) {
+    out.lines.push(`この階の奥に ${getBoss(run.bossId).jp} がいる。`);
+    log(run, `BOSS FLOOR: ${getBoss(run.bossId).jp}`, "danger");
+  }
+  return out;
+}
+
+// ------------------------------------------------------------------- encounters
+function startEncounter(
+  meta: MetaState, run: RunState, entity: DungeonEntity, byPlayer: boolean, out: StepResult,
+): void {
+  const ctx = ctxFor(meta, run, "combat");
+  if (entity.bossId) {
+    if (run.deadNpcs.includes(getBoss(entity.bossId).npcId)) {
+      out.lines.push(`${getBoss(entity.bossId).jp} はもういない。対決は起きなかった。`);
+      run.outcome = "cleared";
+      resolveEnding(meta, run);
+      return;
+    }
+    run.combat = startCombat(ctx, { bossId: entity.bossId });
+    log(run, `BOSS: ${getBoss(entity.bossId).jp}`, "danger");
+  } else {
+    run.combat = startCombat(ctx, { enemyIds: entity.pack ?? ["E_DOG"] });
+    if (!byPlayer) {
+      run.combat.firstStrikeUsed = true;
+      out.lines.push("不意を突かれた。先手は取れない。");
     }
   }
+  run.player.flags["engagedUid"] = 0;
+  run.npcFlags["__engaged"] = [entity.uid];
+  out.combatStarted = true;
 }
 
-export function startBoss(meta: MetaState, run: RunState): EnterResult {
-  const lines: string[] = [];
-  run.step = run.map.steps.length - 1;
-  run.currentNodeId = "NODE_BOSS";
-  let bossId = run.map.bossId;
-
-  // Vane leaves the board entirely if you sent the princess running.
-  if (bossId === "B_VANE" && run.worldDeltas.some((d) => d.rewriteId === "RW03")) bossId = "B_SELD";
-  // The tower route overrides everything: with the key and the knowledge of
-  // what sits at the top, you climb instead of settling the local conspiracy.
-  if (run.player.items.includes("I_GRAVEKEY") && knows(meta, "K018")) {
-    bossId = "B_WRITER";
-    run.map.bossId = bossId;
-    lines.push("灰の鍵が門を開く。あなたは事件ではなく、塔を選んだ。");
-  }
-  if (run.deadNpcs.includes(getBoss(bossId).npcId)) {
-    lines.push(`${getBoss(bossId).jp} はもういない。対決は起きなかった。`);
-    run.outcome = "cleared";
-    return { lines };
-  }
-  if (run.clock > RUN_DEADLINE) {
-    const penalty = Math.floor(run.player.hp * 0.25);
-    run.player.hp = Math.max(1, run.player.hp - penalty);
-    lines.push(`日付が変わった。消耗したまま対峙することになる（HP −${penalty}）`);
-  }
-  const ctx = ctxFor(meta, run, "boss");
-  run.combat = startCombat(ctx, { bossId });
-  log(run, `BOSS: ${getBoss(bossId).jp}`, "danger");
-  return { combatStarted: true, lines };
-}
-
-// ------------------------------------------------------------------- combat glue
 export function doCombatAction(meta: MetaState, run: RunState, action: PlayerAction): ActionResult & {
   resolved?: boolean; reward?: RewardOffer; acquisitions?: Acquisition[];
 } {
@@ -371,8 +521,8 @@ export function doCombatAction(meta: MetaState, run: RunState, action: PlayerAct
     return { ...res, resolved: true, ...out };
   }
   if (c.phase === "lost") {
-    const out = onDeath(meta, run, c.isBoss ? `${getBoss(c.bossId!).jp} に敗れた` : "戦闘で倒れた", c.bossId);
-    return { ...res, resolved: true, acquisitions: out };
+    const acq = onDeath(meta, run, c.isBoss ? `${getBoss(c.bossId!).jp} に敗れた` : "戦闘で倒れた", c.bossId);
+    return { ...res, resolved: true, acquisitions: acq };
   }
   return res;
 }
@@ -382,18 +532,24 @@ function finishCombat(meta: MetaState, run: RunState, fled: boolean): { reward?:
   const wasBoss = c.isBoss;
   const ctx = ctxFor(meta, run, "loot");
   const acquisitions: Acquisition[] = [];
+  const engagedUid = run.npcFlags["__engaged"]?.[0];
 
   if (!fled) {
     const { gold, xp } = combatRewards(ctx, c);
     run.player.gold += gold;
     gainXp(run, xp);
     log(run, `勝利 — Gold +${gold} / XP +${xp}`, "reward");
+    if (engagedUid) run.floor.entities = run.floor.entities.filter((e) => e.uid !== engagedUid);
   } else {
-    run.clock += 60;
-    log(run, "戦闘を回避した（1h）", "info");
+    spendTime(meta, run, 20, []);
+    // slipping away leaves the monster where it was, but awake
+    const e = run.floor.entities.find((x) => x.uid === engagedUid);
+    if (e) e.awake = true;
+    log(run, "戦闘を離脱した", "info");
   }
   run.player.flags["ally"] = 0;
   run.combat = null;
+  run.npcFlags["__engaged"] = [];
 
   if (wasBoss) {
     run.outcome = "cleared";
@@ -401,22 +557,18 @@ function finishCombat(meta: MetaState, run: RunState, fled: boolean): { reward?:
     if (ending) log(run, `ENDING: ${ENDINGS.find((e) => e.id === ending)?.name}`, "info");
     return { acquisitions };
   }
+  if (fled) return { acquisitions };
 
-  const node = currentNode(run);
-  if (node?.knowledgeId && !fled) {
-    acquisitions.push(...grantKnowledge(meta, run, node.knowledgeId));
-  }
-  const reward = offerSkillReward(meta, run, node?.kind === "elite" ? "rare" : "normal");
+  // Builds stay legible only if skills are scarce.  Elites always pay out;
+  // ordinary monsters mostly pay in gold and experience.
+  const wasElite = (c.enemies[0]?.maxHp ?? 0) >= 60;
+  const rng = rngFor(run, "rewardRoll");
+  computeVisibility(run.floor, run.px, run.py, lightRadius(run));
+  if (!wasElite && !rng.chance(0.3)) return { acquisitions };
+
+  const reward = offerSkillReward(meta, run, wasElite ? "rare" : "normal");
   run.pendingReward = reward;
   return { reward, acquisitions };
-}
-
-export function currentNode(run: RunState): MapNode | null {
-  for (const step of run.map.steps) {
-    const n = step.find((x) => x.id === run.currentNodeId);
-    if (n) return n;
-  }
-  return null;
 }
 
 function gainXp(run: RunState, xp: number): void {
@@ -432,12 +584,11 @@ function gainXp(run: RunState, xp: number): void {
 
 // ------------------------------------------------------------------- rewards
 export function offerSkillReward(meta: MetaState, run: RunState, tier: "normal" | "rare" | "explore"): RewardOffer {
-  const rng = rngFor(run, `reward${run.visited.length}`);
+  const rng = rngFor(run, `reward${run.player.xp}`);
   const owned = new Set(run.player.skills);
   const pool = SKILLS.filter((s) => !owned.has(s.id) && (tier === "explore" ? s.pool !== "combat" : s.pool !== "explore"));
-  let picks = rng.sample(pool.map((s) => s.id), 3);
+  const picks = rng.sample(pool.map((s) => s.id), 3);
 
-  // "Rumour of a skill" bought at a shop guarantees a synergy piece.
   if (run.player.flags["synergyTip"] === 1) {
     run.player.flags["synergyTip"] = 0;
     const wanted = pool.map((s) => s.id).filter((id) => synergyHintFor(id, run.player.skills));
@@ -448,8 +599,8 @@ export function offerSkillReward(meta: MetaState, run: RunState, tier: "normal" 
   }
   const synergyHints: Record<number, string> = {};
   picks.forEach((id, i) => {
-    const h = synergyHintFor(id, run.player.skills);
-    if (h) synergyHints[i] = h;
+    const hint = synergyHintFor(id, run.player.skills);
+    if (hint) synergyHints[i] = hint;
   });
   return { kind: "skill", skillIds: picks, synergyHints };
 }
@@ -463,7 +614,7 @@ export function takeReward(meta: MetaState, run: RunState, choice: string | null
     run.player.skills.push(choice);
     lines.push(`${getSkill(choice).jp} を習得した`);
     const before = new Set(run.activeSynergies);
-    const formed = activeSynergies(run.player.skills).map((x) => x.id);
+    const formed = activeSynergies(run.player.skills).map((s) => s.id);
     run.activeSynergies = [...run.activeSynergies, ...formed.filter((x) => !before.has(x))];
     for (const s of formed) {
       if (before.has(s)) continue;
@@ -474,6 +625,7 @@ export function takeReward(meta: MetaState, run: RunState, choice: string | null
     }
   } else if (offer.kind === "item" && offer.itemIds?.includes(choice)) {
     run.player.items.push(choice);
+    applyRelic(run, choice);
     lines.push(`${getItem(choice).jp} を手に入れた`);
   }
   for (const l of lines) log(run, l, "reward");
@@ -481,36 +633,61 @@ export function takeReward(meta: MetaState, run: RunState, choice: string | null
 }
 
 // ------------------------------------------------------------------- scenes
-export function buildScene(meta: MetaState, run: RunState, node: MapNode): EnterResult {
-  const lines: string[] = [];
-  const acquisitions: Acquisition[] = [];
-  const choices: SceneChoice[] = [];
+function openFeatureScene(meta: MetaState, run: RunState, e: DungeonEntity, out: StepResult): void {
   const hasPremonition = run.player.skills.includes("S03");
+  const choices: SceneChoice[] = [];
+  let title = e.name;
   let narrative = "";
-  let title = node.name;
-  let speaker: string | undefined;
-  let dialogue: string | undefined;
 
-  switch (node.kind) {
-    case "discovery": {
-      narrative = "誰も見ていない。調べる時間はある。";
-      choices.push({ actionId: "DISC_TAKE", label: "調べる（Knowledge）", dangerHint: hasPremonition ? "safe" : undefined });
-      choices.push({ actionId: "DISC_FAST", label: "素通りする（時間を戻す）", dangerHint: hasPremonition ? "safe" : undefined });
+  switch (e.feature) {
+    case "stairsDown": {
+      const skip = e.name.includes("スキップ") ? 2 : 1;
+      title = skip > 1 ? "井戸の抜け道" : "下り階段";
+      narrative = skip > 1
+        ? "格子の向こうは井戸の底だ。ここを抜ければ一階層を飛ばせる。"
+        : "下へ続く階段。まだこの階で見ていない場所があるかもしれない。";
+      choices.push({ actionId: `DESCEND:${skip}`, label: skip > 1 ? "▼ 抜け道を使う（1階層スキップ）" : "▼ 降りる" });
+      choices.push({ actionId: "LEAVE", label: "まだ降りない" });
       break;
     }
+    case "chest":
+      narrative = "埃をかぶった箱。鍵はかかっていない。";
+      choices.push({ actionId: `CHEST:${e.uid}`, label: "開ける" });
+      choices.push({ actionId: "LEAVE", label: "触らない" });
+      break;
+    case "lore":
+      narrative = "誰かが残した痕跡。読み解く時間はある。";
+      choices.push({ actionId: `LORE:${e.uid}`, label: "調べる（Knowledge）", dangerHint: hasPremonition ? "safe" : undefined });
+      choices.push({ actionId: "LEAVE", label: "素通りする" });
+      break;
     case "ashdoor": {
-      narrative = "扉の隙間から灰がこぼれている。中に何かがあるのは間違いない。";
       const cost = Math.floor(run.player.hp * 0.25);
-      choices.push({ actionId: "ASH_ENTER", label: `扉を開ける（HP −${cost}）`, dangerHint: hasPremonition ? (run.player.hp - cost <= 10 ? "lethal" : "risky") : undefined });
-      choices.push({ actionId: "ASH_SKIP", label: "引き返す", dangerHint: hasPremonition ? "safe" : undefined });
+      narrative = "扉の隙間から灰がこぼれている。中に何かがあるのは間違いない。";
+      choices.push({
+        actionId: `ASH:${e.uid}`, label: `扉を開ける（HP −${cost}）`,
+        dangerHint: hasPremonition ? (run.player.hp - cost <= 10 ? "lethal" : "risky") : undefined,
+      });
       if (run.player.skills.includes("S05")) {
-        choices.push({ actionId: "ASH_BLOOD", label: "血の代償で強引に開ける（HP −12・確実）", dangerHint: hasPremonition ? "risky" : undefined });
+        choices.push({ actionId: `ASHBLOOD:${e.uid}`, label: "血の代償で開ける（HP −12・確実）" });
       }
+      choices.push({ actionId: "LEAVE", label: "引き返す" });
       break;
     }
+    case "altar":
+      narrative = "古い祭壇。捧げるものを求めている。";
+      choices.push({ actionId: `SHRINE_HP:${e.uid}`, label: "HP を 25% 捧げる（レア Skill 3択）", dangerHint: hasPremonition ? "risky" : undefined });
+      choices.push({ actionId: `SHRINE_GOLD:${e.uid}`, label: "Gold 50 を捧げる（Item）", locked: run.player.gold < 50, lockReason: "Gold が足りない" });
+      choices.push({ actionId: "LEAVE", label: "何も捧げない" });
+      break;
+    case "campfire":
+      narrative = "誰かが焚いた火がまだ残っている。";
+      choices.push({ actionId: `REST_HEAL:${e.uid}`, label: `休む（HP +${Math.floor(run.player.maxHp * 0.4)} / 30分）` });
+      choices.push({ actionId: `REST_TRAIN:${e.uid}`, label: "鍛える（最大 HP +6 / 攻撃力 +2 / 30分）" });
+      choices.push({ actionId: "LEAVE", label: "先へ進む" });
+      break;
     case "shop": {
-      narrative = "商人が荷を広げている。";
-      const rng = rngFor(run, `shop${run.step}`);
+      narrative = "こんなところに商人がいる。";
+      const rng = rngFor(run, `shop${e.uid}`);
       const stock = rng.sample(ITEMS.filter((i) => i.price > 0).map((i) => i.id), 4);
       for (const id of stock) {
         const item = getItem(id);
@@ -520,64 +697,65 @@ export function buildScene(meta: MetaState, run: RunState, node: MapNode): Enter
           locked: run.player.gold < price, lockReason: "Gold が足りない",
         });
       }
-      choices.push({ actionId: "BUY_TIP:60", label: "求めるスキルの噂を買う — 60G（次の3択にシナジー枠が確定で混ざる）", locked: run.player.gold < 60, lockReason: "Gold が足りない" });
-      if (run.player.skills.includes("S10")) choices.push({ actionId: "SHOP_STEAL", label: "盗む（Suspicion +2 のリスク）" });
-      choices.push({ actionId: "LEAVE", label: "立ち去る" });
-      break;
-    }
-    case "shrine": {
-      narrative = "古い祭壇。捧げるものを求めている。";
-      choices.push({ actionId: "SHRINE_HP", label: `HP を 25% 捧げる（レア Skill 3択）`, dangerHint: hasPremonition ? "risky" : undefined });
-      choices.push({ actionId: "SHRINE_GOLD", label: "Gold 50 を捧げる（Item）", locked: run.player.gold < 50, lockReason: "Gold が足りない" });
-      choices.push({ actionId: "LEAVE", label: "何も捧げない" });
-      break;
-    }
-    case "rest": {
-      narrative = "火を起こせる場所がある。";
-      choices.push({ actionId: "REST_HEAL", label: `休む（HP +${Math.floor(run.player.maxHp * 0.4)}）` });
-      choices.push({ actionId: "REST_TRAIN", label: "鍛える（最大 HP +6 / 攻撃力 +2）" });
-      break;
-    }
-    case "social": {
-      const npcId = node.npcId ?? "N01";
-      const npc = NPC_BY_ID.get(npcId)!;
-      speaker = npcId;
-      title = `${node.name} — ${npc.jp}`;
-      narrative = run.deadNpcs.includes(npcId)
-        ? `${npc.jp} の姿はない。` : `${npc.jp} がこちらを見た。`;
-      dialogue = dejaVuLine(meta, npcId);
-      choices.push({ actionId: "TALK", label: "話を聞く" });
-      if (run.player.skills.includes("S01") && npc.lies.length > 0) {
-        choices.push({ actionId: "LIE_EYE", label: `［嘘看破］「それは嘘だ」`, requiresSkill: "S01" });
-      }
-      if (run.player.skills.includes("S13")) {
-        choices.push({ actionId: "EMPATH", label: `［共感］本当の目的を読む`, requiresSkill: "S13" });
-      }
-      if (run.player.skills.includes("S02")) {
-        choices.push({ actionId: "NECRO", label: `［死霊術］近くの死者に聞く`, requiresSkill: "S02" });
-      }
-      if (npcId === "N03" && knows(meta, "K014")) {
-        choices.push({ actionId: "PRESS_PRIEST", label: "［K014］入れ替わりについて問い詰める", requiresKnowledge: "K014" });
-      }
-      for (const rw of availableRewrites(meta, run)) {
-        if (rw.targetNpc !== npcId) continue;
-        choices.push({ actionId: `REWRITE:${rw.id}`, label: `▶ REWRITE — ${rw.title}` });
-      }
+      choices.push({
+        actionId: "BUY_TIP:60",
+        label: "求めるスキルの噂を買う — 60G（次の3択にシナジー枠が確定で混ざる）",
+        locked: run.player.gold < 60, lockReason: "Gold が足りない",
+      });
+      if (run.player.skills.includes("S10")) choices.push({ actionId: `SHOP_STEAL:${e.uid}`, label: "盗む（Suspicion +2 のリスク）" });
       choices.push({ actionId: "LEAVE", label: "立ち去る" });
       break;
     }
     default:
-      narrative = "特に何もない。";
-      choices.push({ actionId: "LEAVE", label: "進む" });
+      return;
   }
 
-  return {
-    scene: {
-      nodeId: node.id, title, narrative, speaker, dialogue,
-      choices, allowFreeAction: node.kind !== "shop",
-    },
-    acquisitions, lines,
+  run.pendingScene = {
+    nodeId: e.uid, title, narrative, choices,
+    allowFreeAction: e.feature !== "shop",
   };
+  out.sceneOpened = true;
+}
+
+function openNpcScene(meta: MetaState, run: RunState, e: DungeonEntity, out: StepResult): void {
+  const npcId = e.npcId ?? "N01";
+  const npc = NPC_BY_ID.get(npcId)!;
+  const choices: SceneChoice[] = [];
+  const dead = run.deadNpcs.includes(npcId) || e.used;
+
+  if (!dead) {
+    if (!e.used) choices.push({ actionId: `TALK:${e.uid}`, label: "話を聞く" });
+    else choices.push({ actionId: "LEAVE_SPENT", label: "（もう話すことはなさそうだ）" });
+    if (run.player.skills.includes("S01") && npc.lies.length > 0) {
+      choices.push({ actionId: `LIE_EYE:${e.uid}`, label: "［嘘看破］「それは嘘だ」", requiresSkill: "S01" });
+    }
+    if (run.player.skills.includes("S13")) {
+      choices.push({ actionId: `EMPATH:${e.uid}`, label: "［共感］本当の目的を読む", requiresSkill: "S13" });
+    }
+    if (run.player.skills.includes("S02")) {
+      choices.push({ actionId: `NECRO:${e.uid}`, label: "［死霊術］近くの死者に聞く", requiresSkill: "S02" });
+    }
+    if (npcId === "N03" && knows(meta, "K014")) {
+      choices.push({ actionId: `PRESS_PRIEST:${e.uid}`, label: "［K014］入れ替わりについて問い詰める", requiresKnowledge: "K014" });
+    }
+    for (const rw of availableRewrites(meta, run)) {
+      if (rw.targetNpc !== npcId) continue;
+      choices.push({ actionId: `REWRITE:${rw.id}`, label: `▶ REWRITE — ${rw.title}` });
+    }
+  }
+  choices.push({ actionId: `PASS:${e.uid}`, label: "すれ違って先へ進む" });
+  choices.push({ actionId: "LEAVE", label: "立ち去る" });
+
+  run.pendingScene = {
+    nodeId: e.uid,
+    title: `${currentPlace(run).name} — ${npc.jp}`,
+    narrative: dead ? `${npc.jp} の姿はない。` : `${npc.jp} がこちらを見た。`,
+    speaker: npcId,
+    dialogue: dead ? undefined : dejaVuLine(meta, npcId),
+    choices,
+    allowFreeAction: true,
+  };
+  out.sceneOpened = true;
 }
 
 export interface ChoiceResult {
@@ -586,43 +764,49 @@ export interface ChoiceResult {
   reward?: RewardOffer;
   sceneClosed: boolean;
   combatStarted?: boolean;
+  descended?: boolean;
   rewriteApplied?: string;
 }
 
 export function resolveChoice(meta: MetaState, run: RunState, actionId: string): ChoiceResult {
   const lines: string[] = [];
   const acquisitions: Acquisition[] = [];
-  const node = currentNode(run);
-  const rng = rngFor(run, `choice${run.step}:${actionId}`);
+  const rng = rngFor(run, `choice:${actionId}`);
+  const [verb, arg, arg2] = actionId.split(":");
+  const spend = (m: number): void => spendTime(meta, run, m, lines);
+  const entity = arg ? run.floor.entities.find((e) => e.uid === arg) : undefined;
   let sceneClosed = true;
   let reward: RewardOffer | undefined;
   let rewriteApplied: string | undefined;
+  let descended = false;
 
-  if (actionId.startsWith("REWRITE:")) {
-    const id = actionId.slice(8);
-    const res = applyRewrite(meta, run, id);
-    lines.push(`REWRITE — ${REWRITE_BY_ID.get(id)!.utterance}`, ...res.lines);
-    rewriteApplied = id;
-    sceneClosed = false;
+  const consume = (): void => {
+    if (!entity) return;
+    run.floor.entities = run.floor.entities.filter((e) => e.uid !== entity.uid);
+  };
+
+  if (verb === "REWRITE") {
+    const res = applyRewrite(meta, run, arg!);
+    lines.push(`REWRITE — ${REWRITE_BY_ID.get(arg!)!.utterance}`, ...res.lines);
+    rewriteApplied = arg;
     if (run.pendingScene) {
       run.pendingScene.choices = run.pendingScene.choices.filter((c) => c.actionId !== actionId);
     }
-    return { lines, acquisitions, sceneClosed, rewriteApplied };
+    return { lines, acquisitions, sceneClosed: false, rewriteApplied };
   }
-  if (actionId.startsWith("BUY:")) {
-    const [, itemId, priceStr] = actionId.split(":");
-    const price = Number(priceStr);
+  if (verb === "BUY") {
+    const price = Number(arg2);
     if (run.player.gold >= price) {
       run.player.gold -= price;
-      run.player.items.push(itemId!);
-      applyRelic(run, itemId!);
-      lines.push(`${getItem(itemId!).jp} を買った（−${price}G）`);
+      run.player.items.push(arg!);
+      applyRelic(run, arg!);
+      lines.push(`${getItem(arg!).jp} を買った（−${price}G）`);
     } else lines.push("Gold が足りない");
     if (run.pendingScene) run.pendingScene.choices = run.pendingScene.choices.filter((c) => c.actionId !== actionId);
     return { lines, acquisitions, sceneClosed: false };
   }
-  if (actionId.startsWith("BUY_TIP:")) {
-    const price = Number(actionId.split(":")[1]);
+  if (verb === "BUY_TIP") {
+    const price = Number(arg);
     if (run.player.gold >= price) {
       run.player.gold -= price;
       run.player.flags["synergyTip"] = 1;
@@ -630,17 +814,20 @@ export function resolveChoice(meta: MetaState, run: RunState, actionId: string):
     } else lines.push("Gold が足りない");
     return { lines, acquisitions, sceneClosed: false };
   }
-
-  if (actionId.startsWith("VILLAGE_") && actionId !== "VILLAGE_LEAVE") {
-    run.player.flags["villageActions"] = (run.player.flags["villageActions"] ?? 0) + 1;
+  if (verb === "DESCEND") {
+    const r = descend(meta, run, Number(arg) || 1);
+    lines.push(...r.lines);
+    return { lines, acquisitions, sceneClosed: true, descended: true };
   }
 
-  switch (actionId) {
+  switch (verb) {
     case "VILLAGE_REST":
-      run.clock += 60; run.player.hp = Math.min(run.player.maxHp, run.player.hp + 20);
+      run.player.flags["villageActions"] = (run.player.flags["villageActions"] ?? 0) + 1;
+      spend(60); run.player.hp = Math.min(run.player.maxHp, run.player.hp + 20);
       lines.push("少し休んだ（HP +20）"); sceneClosed = false; break;
     case "VILLAGE_ASK": {
-      run.clock += 60;
+      run.player.flags["villageActions"] = (run.player.flags["villageActions"] ?? 0) + 1;
+      spend(60);
       const hint = nearSynthesis(new Set(Object.keys(meta.knowledge)));
       if (hint.length > 0) {
         lines.push(`「${getKnowledge(hint[0]!.missing[0]!).title.slice(0, 10)}……そんな話を聞いたことがある」`);
@@ -649,6 +836,7 @@ export function resolveChoice(meta: MetaState, run: RunState, actionId: string):
       sceneClosed = false; break;
     }
     case "VILLAGE_SHOP": {
+      run.player.flags["villageActions"] = (run.player.flags["villageActions"] ?? 0) + 1;
       const stock = rng.sample(ITEMS.filter((i) => i.price > 0 && i.rarity !== "rare").map((i) => i.id), 3);
       if (run.pendingScene) {
         for (const id of stock) {
@@ -663,41 +851,95 @@ export function resolveChoice(meta: MetaState, run: RunState, actionId: string):
       lines.push("荷を広げてもらった"); sceneClosed = false; break;
     }
     case "VILLAGE_LEAVE":
-      lines.push("村を出た"); break;
-    case "DISC_TAKE": {
-      if (node?.knowledgeId) {
-        acquisitions.push(...grantKnowledge(meta, run, node.knowledgeId));
-        if (run.player.skills.includes("S09")) {
+      lines.push("井戸を降りた。"); break;
+
+    case "LORE": {
+      if (entity?.knowledgeId) {
+        acquisitions.push(...grantKnowledge(meta, run, entity.knowledgeId));
+        const chronicled = run.player.flags["chronicled"] ?? 0;
+        if (run.player.skills.includes("S09") && chronicled < 3) {
+          run.player.flags["chronicled"] = chronicled + 1;
           const extra = KNOWLEDGE.find((k) => !meta.knowledge[k.id] && !k.synthesizedFrom);
           if (extra) { acquisitions.push(...grantKnowledge(meta, run, extra.id, { reliability: "rumor" })); lines.push("記録者: もう1つ書き留めた"); }
         }
       } else {
         const g = rng.int(20, 45); run.player.gold += g; lines.push(`めぼしいものはなかった（Gold +${g}）`);
       }
+      if (!run.player.skills.includes("S09")) spend(20);
+      consume();
       break;
     }
-    case "DISC_FAST":
-      run.clock -= 60; lines.push("何も調べずに進んだ（1h 取り戻した）"); break;
-    case "ASH_ENTER":
-    case "ASH_BLOOD": {
-      const cost = actionId === "ASH_BLOOD" ? 12 : Math.floor(run.player.hp * 0.25);
+    case "CHEST": {
+      const item = rng.pick(ITEMS.filter((i) => i.price > 0));
+      run.player.items.push(item.id); applyRelic(run, item.id);
+      lines.push(`${item.jp} が入っていた`);
+      const g = rng.int(15, 40); run.player.gold += g; lines.push(`Gold +${g}`);
+      spend(10);
+      consume();
+      break;
+    }
+    case "ASH":
+    case "ASHBLOOD": {
+      const cost = verb === "ASHBLOOD" ? 12 : Math.floor(run.player.hp * 0.25);
       run.player.hp = Math.max(1, run.player.hp - cost);
       lines.push(`灰の扉をくぐった（HP −${cost}）`);
-      if (node?.knowledgeId) acquisitions.push(...grantKnowledge(meta, run, node.knowledgeId));
-      else {
-        const unknown = KNOWLEDGE.filter((k) => !meta.knowledge[k.id] && !k.synthesizedFrom);
-        if (unknown.length > 0) acquisitions.push(...grantKnowledge(meta, run, rng.pick(unknown).id));
+      spend(20);
+      if (entity?.knowledgeId) {
+        acquisitions.push(...grantKnowledge(meta, run, entity.knowledgeId));
+      } else if (run.player.flags["ashSecret"] !== 1) {
+        // Exactly one forbidden secret per run.  The ash door is the gamble
+        // that buys a truth living eight floors down — not a vending machine.
+        run.player.flags["ashSecret"] = 1;
+        const deep = KNOWLEDGE.filter(
+          (k) => !meta.knowledge[k.id] && !k.synthesizedFrom
+            && (k.tags.includes("truth") || k.tags.includes("lore")),
+        );
+        const any = KNOWLEDGE.filter((k) => !meta.knowledge[k.id] && !k.synthesizedFrom);
+        const pool = deep.length > 0 ? deep : any;
+        if (pool.length > 0) acquisitions.push(...grantKnowledge(meta, run, rng.pick(pool).id));
+      } else {
+        const g = rng.int(40, 80);
+        run.player.gold += g;
+        lines.push(`扉の奥は空だった（Gold +${g}）`);
       }
       const item = rng.pick(ITEMS.filter((i) => i.rarity !== "common"));
       run.player.items.push(item.id); applyRelic(run, item.id);
       lines.push(`${item.jp} を見つけた`);
+      consume();
       if (run.player.hp <= 1 && rng.chance(0.3)) {
-        onDeath(meta, run, "灰の扉の向こうで力尽きた");
+        acquisitions.push(...onDeath(meta, run, "灰の扉の向こうで力尽きた"));
         lines.push("……ここまでだった。");
       }
       break;
     }
-    case "ASH_SKIP": lines.push("扉は閉じたままにした"); break;
+    case "SHRINE_HP": {
+      const cost = Math.floor(run.player.hp * 0.25);
+      run.player.hp = Math.max(1, run.player.hp - cost);
+      lines.push(`血を捧げた（HP −${cost}）`);
+      reward = offerSkillReward(meta, run, "rare"); run.pendingReward = reward;
+      consume();
+      break;
+    }
+    case "SHRINE_GOLD": {
+      run.player.gold -= 50;
+      const item = rng.pick(ITEMS.filter((i) => i.rarity !== "common"));
+      run.player.items.push(item.id); applyRelic(run, item.id);
+      lines.push(`${item.jp} が現れた`);
+      consume();
+      break;
+    }
+    case "REST_HEAL":
+      run.player.hp = Math.min(run.player.maxHp, run.player.hp + Math.floor(run.player.maxHp * 0.4));
+      spend(30);
+      lines.push("火の前で休んだ");
+      consume();
+      break;
+    case "REST_TRAIN":
+      run.player.maxHp += 6; run.player.hp += 6; run.player.power += 2;
+      spend(30);
+      lines.push("型を確かめた（最大 HP +6 / 攻撃力 +2）");
+      consume();
+      break;
     case "SHOP_STEAL": {
       if (rng.chance(0.6)) {
         const item = rng.pick(ITEMS.filter((i) => i.price > 0));
@@ -706,51 +948,41 @@ export function resolveChoice(meta: MetaState, run: RunState, actionId: string):
       } else { run.suspicion += 2; lines.push("見られた（Suspicion +2）"); }
       sceneClosed = false; break;
     }
-    case "SHRINE_HP": {
-      const cost = Math.floor(run.player.hp * 0.25);
-      run.player.hp = Math.max(1, run.player.hp - cost);
-      lines.push(`血を捧げた（HP −${cost}）`);
-      reward = offerSkillReward(meta, run, "rare"); run.pendingReward = reward; break;
-    }
-    case "SHRINE_GOLD": {
-      run.player.gold -= 50;
-      const item = rng.pick(ITEMS.filter((i) => i.rarity !== "common"));
-      run.player.items.push(item.id); applyRelic(run, item.id);
-      lines.push(`${item.jp} が現れた`); break;
-    }
-    case "REST_HEAL":
-      run.player.hp = Math.min(run.player.maxHp, run.player.hp + Math.floor(run.player.maxHp * 0.4));
-      lines.push("火の前で休んだ"); break;
-    case "REST_TRAIN":
-      run.player.maxHp += 6; run.player.hp += 6; run.player.power += 2;
-      lines.push("型を確かめた（最大 HP +6 / 攻撃力 +2）"); break;
     case "TALK": {
-      const npcId = node?.npcId ?? "N01";
+      const npcId = entity?.npcId ?? "N01";
       const npc = NPC_BY_ID.get(npcId)!;
       lines.push(`「${npc.publicGoal}。それだけだ」`);
-      if (node?.knowledgeId && rng.chance(run.player.items.includes("I_EAVESDROP") ? 0.9 : 0.6)) {
-        acquisitions.push(...grantKnowledge(meta, run, node.knowledgeId, { reliability: "uncertain" }));
-      } else if (node?.knowledgeId) {
+      spend(10);
+      if (entity) entity.used = true;
+      if (entity?.knowledgeId && rng.chance(run.player.items.includes("I_EAVESDROP") ? 0.9 : 0.6)) {
+        acquisitions.push(...grantKnowledge(meta, run, entity.knowledgeId, { reliability: "uncertain" }));
+      } else if (entity?.knowledgeId) {
         lines.push("（もう少し踏み込めば何か聞けたかもしれない）");
       }
       break;
     }
     case "LIE_EYE": {
-      const npcId = node?.npcId ?? "N01";
+      const npcId = entity?.npcId ?? "N01";
       const npc = NPC_BY_ID.get(npcId)!;
       lines.push(`［嘘看破］「${npc.lies[0] ?? "……"}」— それは嘘だ。`);
-      if (node?.knowledgeId) acquisitions.push(...grantKnowledge(meta, run, node.knowledgeId, { reliability: "confirmed" }));
+      if (entity?.knowledgeId) acquisitions.push(...grantKnowledge(meta, run, entity.knowledgeId, { reliability: "confirmed" }));
       run.npcTrust[npcId] = (run.npcTrust[npcId] ?? 0) - 1;
       break;
     }
     case "EMPATH": {
-      const npcId = node?.npcId ?? "N01";
+      const npcId = entity?.npcId ?? "N01";
       const npc = NPC_BY_ID.get(npcId)!;
       lines.push(`［共感］この人物が本当に望んでいるのは —「${npc.trueGoal}」`);
-      if (node?.knowledgeId) acquisitions.push(...grantKnowledge(meta, run, node.knowledgeId, { reliability: "uncertain" }));
+      if (entity?.knowledgeId) acquisitions.push(...grantKnowledge(meta, run, entity.knowledgeId, { reliability: "uncertain" }));
       break;
     }
     case "NECRO": {
+      const used = run.player.flags["necroUses"] ?? 0;
+      if (used >= 2) {
+        lines.push("［死霊術］この階の死者は、もう何も覚えていない。");
+        break;
+      }
+      run.player.flags["necroUses"] = used + 1;
       const confirmed = run.activeSynergies.includes("Y01");
       lines.push(confirmed
         ? "［死者の嘘］死者は生前についた嘘まで吐き出した。"
@@ -761,18 +993,24 @@ export function resolveChoice(meta: MetaState, run: RunState, actionId: string):
       }
       break;
     }
-    case "PRESS_PRIEST": {
+    case "PRESS_PRIEST":
       lines.push("「……あの方は、もうおられません」");
       acquisitions.push(...grantKnowledge(meta, run, "K007", { reliability: "confirmed" }));
       run.npcTrust["N03"] = (run.npcTrust["N03"] ?? 0) - 2;
       break;
-    }
     case "LEAVE": lines.push("先へ進んだ"); break;
+    case "LEAVE_SPENT": lines.push("……"); break;
+    case "PASS": {
+      if (entity) {
+        entity.used = true;
+        lines.push(`${entity.name}の横をすり抜けた。`);
+      }
+      break;
+    }
     default: lines.push("……"); break;
   }
 
-  // The hub has a small action budget: it is a staging area, not a place to idle.
-  if (run.pendingScene?.nodeId === "NODE_VILLAGE" && !sceneClosed) {
+  if (run.pendingScene?.nodeId === "SURFACE" && !sceneClosed) {
     const left = VILLAGE_ACTION_BUDGET - (run.player.flags["villageActions"] ?? 0);
     run.pendingScene.choices = run.pendingScene.choices.filter(
       (c) => !c.actionId.startsWith("VILLAGE_") || c.actionId === "VILLAGE_LEAVE" || left > 0,
@@ -784,10 +1022,15 @@ export function resolveChoice(meta: MetaState, run: RunState, actionId: string):
     }
   }
 
+  if (run.player.hp <= 0 && run.outcome === "running") {
+    acquisitions.push(...onDeath(meta, run, "灰に呑まれた"));
+    sceneClosed = true;
+  }
   if (sceneClosed) run.pendingScene = null;
+  computeVisibility(run.floor, run.px, run.py, lightRadius(run));
   for (const l of lines) log(run, l, "info");
   for (const a of acquisitions) log(run, `KNOWLEDGE: ${a.def.title}`, "knowledge");
-  return { lines, acquisitions, reward, sceneClosed };
+  return { lines, acquisitions, reward, sceneClosed, descended, rewriteApplied };
 }
 
 function applyRelic(run: RunState, itemId: string): void {
@@ -804,14 +1047,13 @@ export function onDeath(meta: MetaState, run: RunState, cause: string, bossId?: 
   run.outcome = "dead";
   run.deathCause = cause;
   run.combat = null;
+  run.pendingScene = null;
   const acquisitions: Acquisition[] = [];
 
-  // Losing to a boss always teaches you something (SELF_REVIEW Q5-3).
   if (bossId) {
     const k = getBoss(bossId).consolationKnowledge;
     if (!meta.knowledge[k]) acquisitions.push(...grantKnowledge(meta, run, k));
   }
-  // Martyr's Bargain / Posthumous Papers turn dying into a harvest.
   if (run.activeSynergies.includes("Y08")) {
     for (const id of run.knowledgeGainedThisRun) {
       const rec = meta.knowledge[id];
@@ -827,13 +1069,22 @@ export function onDeath(meta: MetaState, run: RunState, cause: string, bossId?: 
 }
 
 function resolveEnding(meta: MetaState, run: RunState): EndingId | undefined {
-  const boss = run.map.bossId;
-  let ending: EndingId | undefined;
-  if (boss === "B_WRITER") ending = "E3";
-  else if (boss === "B_SELD" && (knows(meta, "K007") || knows(meta, "K022"))) ending = "E2";
+  let ending: EndingId;
+  if (run.bossId === "B_WRITER") ending = "E3";
+  else if (run.bossId === "B_SELD" && (knows(meta, "K007") || knows(meta, "K022"))) ending = "E2";
   else ending = "E1";
-  if (ending && !meta.unlockedEndings.includes(ending)) meta.unlockedEndings.push(ending);
+  if (!meta.unlockedEndings.includes(ending)) meta.unlockedEndings.push(ending);
   return ending;
+}
+
+/** The tower route overrides the local conspiracy: key plus K018 changes who waits below. */
+export function checkTowerRoute(meta: MetaState, run: RunState): boolean {
+  if (run.bossId === "B_WRITER") return false;
+  if (!run.player.items.includes("I_GRAVEKEY") || !knows(meta, "K018")) return false;
+  run.bossId = "B_WRITER";
+  for (const e of run.floor.entities) if (e.bossId) e.bossId = "B_WRITER";
+  log(run, "灰の鍵が反応している。最下層で待つ者が変わった。", "rewrite");
+  return true;
 }
 
 // ------------------------------------------------------------------- report
@@ -858,7 +1109,7 @@ export function buildReport(meta: MetaState, run: RunState): RunReport {
   if (bossActions.length > 0) nextRunUnlocks.push(`ボス戦の選択肢が ${bossActions.length} つ増えます`);
   for (const k of newK) {
     for (const e of k.effects) {
-      if (e.includes("出現") || e.includes("ショートカット") || e.includes("回避") || e.includes("×2")) {
+      if (e.includes("出現") || e.includes("ショートカット") || e.includes("回避") || e.includes("×2") || e.includes("短縮")) {
         nextRunUnlocks.push(e);
       }
     }
@@ -866,7 +1117,7 @@ export function buildReport(meta: MetaState, run: RunState): RunReport {
   for (const hint of nearSynthesis(heldAfter)) {
     nextRunUnlocks.push(`あと 1 つで「${getKnowledge(hint.id).title}」が繋がります`);
   }
-  if (nextRunUnlocks.length === 0) nextRunUnlocks.push("まだ世界は同じ形をしている。もう一度、別の道を試せます。");
+  if (nextRunUnlocks.length === 0) nextRunUnlocks.push("まだ迷宮は同じ形をしている。もう一度、別の道を試せます。");
 
   const relationships = newK
     .flatMap((k) => getKnowledge(k.id).relatedNPCs)
@@ -880,8 +1131,8 @@ export function buildReport(meta: MetaState, run: RunState): RunReport {
 
   let epitaph: string;
   if (run.outcome === "cleared") {
-    epitaph = "あなたは今回の終わりまで辿り着いた。世界はまだ、同じ場所を回っている。";
-  } else if (run.deathCause?.includes("灰の扉")) {
+    epitaph = "あなたは最下層まで辿り着いた。迷宮はまだ、同じ場所を回っている。";
+  } else if (run.deathCause?.includes("灰")) {
     epitaph = "あなたは知るために死んだ。それは無駄ではない。";
   } else if (run.deathCause?.includes("敗れた")) {
     epitaph = `あなたは${run.deathCause.replace(" に敗れた", "")}の戦い方を見た。次は、それを知っている。`;
@@ -896,7 +1147,7 @@ export function buildReport(meta: MetaState, run: RunState): RunReport {
     epitaph,
     newKnowledge: newK,
     firstSeen: run.firstSeenThisRun,
-    bossesDefeated: run.outcome === "cleared" ? [getBoss(run.map.bossId).jp] : [],
+    bossesDefeated: run.outcome === "cleared" ? [getBoss(run.bossId).jp] : [],
     relationshipsLearned: relationships,
     historyRewritten: run.worldDeltas.map((d) => d.summary),
     bestSynergy: run.activeSynergies.length > 0
@@ -905,7 +1156,8 @@ export function buildReport(meta: MetaState, run: RunState): RunReport {
     nextRunUnlocks: nextRunUnlocks.slice(0, 6),
     rewriteButtonLabel,
     endingReached: run.outcome === "cleared" ? meta.unlockedEndings[meta.unlockedEndings.length - 1] : undefined,
+    deepestFloor: `B${run.depth}F ${stratumFor(run.depth).title}`,
   };
 }
 
-export { WORLD_TRUTHS };
+export { WORLD_TRUTHS, DUNGEON_DEPTH };

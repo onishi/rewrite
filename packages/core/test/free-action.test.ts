@@ -15,12 +15,12 @@ test("knowing about the poison lets you feed the meal to the dog — and history
   const meta = newMeta();
   const run = startRun(meta, "dog");
   grantKnowledge(meta, run, "K013");
-  const before = run.map.bossId;
+  const before = run.bossId;
   const r = adjudicate(meta, run, intent({ verb: "give", target: "DOG" }), "王の料理を犬に食べさせる");
 
   assert.equal(r.outcome, "success");
   assert.equal(r.rewriteApplied, "RW02");
-  assert.notEqual(run.map.bossId, before, "averting the poisoning must change who you face");
+  assert.notEqual(run.bossId, before, "averting the poisoning must change who you face");
   assert.equal(knows(meta, "K013"), false, "and it must cost you the knowledge that enabled it");
 });
 
@@ -38,7 +38,7 @@ test("naming the princess triggers the rewrite only with confirmed Knowledge", (
   grantKnowledge(meta, run, "K007");
   const r = adjudicate(meta, run, intent({ verb: "talk", target: "PRINCESS" }), "王女を本名で呼ぶ");
   assert.equal(r.rewriteApplied, "RW03");
-  assert.equal(run.map.bossId, "B_SELD");
+  assert.equal(run.bossId, "B_SELD");
 });
 
 test("attacking the bridge instead of the enemy is a real option", () => {

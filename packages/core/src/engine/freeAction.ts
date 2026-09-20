@@ -3,7 +3,7 @@ import type { LLMProvider, InterpretResponse, WorldContext } from "../llm/provid
 import { NPC_BY_ID, WORLD_TRUTHS, getItem, ITEMS } from "../content/world.js";
 import { getKnowledge, KNOWLEDGE } from "../content/knowledge.js";
 import { knows, grantKnowledge, type Acquisition } from "./knowledge.js";
-import { currentNode, applyRewrite, dejaVuStage, startBoss, onDeath } from "./run.js";
+import { currentPlace, applyRewrite, dejaVuStage, onDeath } from "./run.js";
 import { startCombat } from "./combat.js";
 import { Rng } from "../rng.js";
 
@@ -31,7 +31,7 @@ export interface FreeActionResult {
 }
 
 export function buildWorldContext(meta: MetaState, run: RunState, npcId?: string): WorldContext {
-  const node = currentNode(run);
+  const place = currentPlace(run);
   const npc = npcId ? NPC_BY_ID.get(npcId) : undefined;
   return {
     worldTruths: WORLD_TRUTHS.map((t) => ({
@@ -47,8 +47,8 @@ export function buildWorldContext(meta: MetaState, run: RunState, npcId?: string
     } : undefined,
     state: {
       clock: `${String(Math.floor(run.clock / 60) % 24).padStart(2, "0")}:${String(run.clock % 60).padStart(2, "0")}`,
-      location: node?.name ?? "村アシュメア",
-      act: node?.act ?? 0,
+      location: place.name,
+      act: place.depth,
       playerHpPct: Math.round((run.player.hp / run.player.maxHp) * 100),
       suspicion: run.suspicion,
       distortion: meta.distortion,
@@ -63,7 +63,7 @@ export function buildWorldContext(meta: MetaState, run: RunState, npcId?: string
 
 export function knownTargets(meta: MetaState, run: RunState): { id: string; label: string }[] {
   const out: { id: string; label: string }[] = [];
-  const node = currentNode(run);
+  const place = currentPlace(run);
   for (const npc of NPC_BY_ID.values()) {
     if (run.deadNpcs.includes(npc.id)) continue;
     out.push({ id: npc.id, label: npc.jp });
@@ -72,11 +72,11 @@ export function knownTargets(meta: MetaState, run: RunState): { id: string; labe
   out.push({ id: "KING", label: "王" });
   out.push({ id: "DOG", label: "犬" });
   out.push({ id: "SELF", label: "自分" });
-  if (node) out.push({ id: node.id, label: node.name });
+  out.push({ id: "FLOOR", label: place.name });
   if (run.combat) for (const e of run.combat.enemies) out.push({ id: e.uid, label: e.name });
-  if (node?.region === "forest" || node?.region === "road") out.push({ id: "BRIDGE", label: "吊り橋" });
-  if (node?.region === "sewer") out.push({ id: "GRATE", label: "鉄格子" });
-  if (node?.region === "castle") out.push({ id: "MEAL", label: "料理" });
+  if (place.region === "forest" || place.region === "road") out.push({ id: "BRIDGE", label: "吊り橋" });
+  if (place.region === "sewer") out.push({ id: "GRATE", label: "鉄格子" });
+  if (place.region === "castle") out.push({ id: "MEAL", label: "料理" });
   return out;
 }
 
@@ -89,7 +89,7 @@ export function knownInstruments(run: RunState): { id: string; label: string }[]
 export async function performFreeAction(
   meta: MetaState, run: RunState, provider: LLMProvider, raw: string,
 ): Promise<FreeActionResult> {
-  const ctx = buildWorldContext(meta, run, currentNode(run)?.npcId);
+  const ctx = buildWorldContext(meta, run, currentPlace(run).npcId);
   const targets = knownTargets(meta, run);
   const instruments = knownInstruments(run);
   const intent = await provider.interpretAction({ context: ctx, raw, knownTargets: targets, knownInstruments: instruments });
@@ -107,7 +107,7 @@ export function adjudicate(
   const rng = new Rng(`${run.seed}:free:${run.clock}:${raw}`);
   const lines: string[] = [];
   const acquisitions: Acquisition[] = [];
-  const node = currentNode(run);
+  const place = currentPlace(run);
   let outcome: Outcome = "informative";
   let timeCost = 30;
   let combatStarted = false;
@@ -183,13 +183,13 @@ export function adjudicate(
     }
   }
   // ---- Poisoning a cup at a social scene
-  else if (intent.verb === "use" && intent.instrument === "I_POISONVIAL" && node?.kind === "social") {
+  else if (intent.verb === "use" && intent.instrument === "I_POISONVIAL" && !!place.npcId) {
     const silent = run.activeSynergies.includes("Y06");
     run.player.items.splice(run.player.items.indexOf("I_POISONVIAL"), 1);
     if (silent) {
       outcome = "success"; beat = "silent_poison";
       lines.push("［毒杯］誰も、あなたの手元を見ていなかった。");
-      run.npcTrust[node.npcId ?? "N01"] = -3;
+      run.npcTrust[place.npcId ?? "N01"] = -3;
     } else {
       outcome = "partial"; beat = "poison_seen";
       run.suspicion += 3;
@@ -198,7 +198,7 @@ export function adjudicate(
   }
   // ---- Naming a lie you shouldn't know about
   else if (intent.verb === "deceive" || intent.verb === "persuade") {
-    const npcId = node?.npcId ?? (t && NPC_BY_ID.has(t) ? t : null);
+    const npcId = place.npcId ?? (t && NPC_BY_ID.has(t) ? t : null);
     if (npcId && intent.usesKnowledge.length > 0) {
       outcome = "success"; beat = "knowledge_pressed";
       run.suspicion += 2;
@@ -225,7 +225,7 @@ export function adjudicate(
   // ---- Starting a fight out of a scene
   else if (intent.verb === "attack" && !run.combat) {
     outcome = "partial"; beat = "provoked_fight";
-    const enemies = node?.region === "castle" ? ["E_KNIGHT", "E_KNIGHT"] : ["E_BANDIT"];
+    const enemies = place.region === "castle" ? ["E_KNIGHT", "E_KNIGHT"] : ["E_BANDIT"];
     run.combat = startCombat({ meta, run, rng }, { enemyIds: enemies });
     combatStarted = true;
     run.suspicion += 2;
@@ -254,8 +254,12 @@ export function adjudicate(
     outcome = "informative"; beat = "observation";
     const observations = buildObservations(meta, run);
     lines.push(rng.pick(observations));
-    if (node?.knowledgeId && !meta.knowledge[node.knowledgeId] && rng.chance(0.35)) {
-      acquisitions.push(...grantKnowledge(meta, run, node.knowledgeId, { reliability: "rumor" }));
+    const nearbyLore = run.floor.entities.find(
+      (e) => e.knowledgeId && !meta.knowledge[e.knowledgeId]
+        && Math.max(Math.abs(e.x - run.px), Math.abs(e.y - run.py)) <= 6,
+    );
+    if (nearbyLore?.knowledgeId && rng.chance(0.45)) {
+      acquisitions.push(...grantKnowledge(meta, run, nearbyLore.knowledgeId, { reliability: "rumor" }));
       lines.push("（噂として書き留めた）");
     }
   }
@@ -271,14 +275,14 @@ export function adjudicate(
 /** Failure still teaches: observations point at knowledge the player lacks. */
 function buildObservations(meta: MetaState, run: RunState): string[] {
   const out: string[] = [];
-  const node = currentNode(run);
-  if (!knows(meta, "K013") && node?.region === "castle") {
+  const place = currentPlace(run);
+  if (!knows(meta, "K013") && place.region === "castle") {
     out.push("厨房の棚に、王の卓にだけ使われる小瓶がある。犬はその皿に近づかない。");
   }
   if (!knows(meta, "K004")) out.push("壁の燭台が全て外されている。この城の誰かは、火を置きたがらない。");
-  if (!knows(meta, "K012") && node?.region === "church") out.push("床石の一枚だけ、擦り減り方が違う。");
-  if (!knows(meta, "K008") && node?.region === "sewer") out.push("北の格子の向こうから、桶を引き上げる音がする。");
-  if (meta.distortion >= 6) out.push("同じ場所のはずなのに、柱の数が昨日と違う気がする。");
+  if (!knows(meta, "K012") && place.region === "church") out.push("床石の一枚だけ、擦り減り方が違う。");
+  if (!knows(meta, "K008") && place.region === "sewer") out.push("北の格子の向こうから、桶を引き上げる音がする。");
+  if (meta.distortion >= 6) out.push("同じ階層のはずなのに、部屋の数が前回と違う気がする。");
   out.push("特に何も起きなかった。だが、見ていなければ気づかなかったことがある。");
   out.push("誰も見ていない。それ自体が、少し不自然だ。");
   return out;

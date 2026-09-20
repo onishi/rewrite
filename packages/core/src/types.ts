@@ -5,6 +5,8 @@
  * that matters.  Every numeric field below is written exclusively by the engine.
  */
 
+import type { Floor } from "./dungeon/types.js";
+
 // ---------------------------------------------------------------- identifiers
 export type SkillId = string;
 export type ItemId = string;
@@ -282,46 +284,6 @@ export interface RewriteDef {
   effects: RewriteEffect[];
 }
 
-// ---------------------------------------------------------------- map
-export type NodeKind =
-  | "hub"
-  | "combat"
-  | "elite"
-  | "social"
-  | "discovery"
-  | "shop"
-  | "shrine"
-  | "rest"
-  | "ashdoor"
-  | "boss";
-
-export interface MapNode {
-  id: NodeId;
-  kind: NodeKind;
-  name: string;
-  region: string;
-  act: number;
-  step: number;
-  danger: 0 | 1 | 2 | 3;
-  timeCost: number; // minutes
-  tags: string[];
-  /** reward hints shown before entering */
-  hints: string[];
-  enemyIds?: EnemyId[];
-  npcId?: NpcId;
-  knowledgeId?: KnowledgeId;
-  /** true when the player only sees it because of Knowledge */
-  revealedByKnowledge?: KnowledgeId;
-  /** encounter converted to social by Knowledge */
-  convertedBy?: KnowledgeId;
-}
-
-export interface RunMap {
-  /** steps[i] = the set of nodes offered at step i */
-  steps: MapNode[][];
-  bossId: EnemyId;
-}
-
 // ---------------------------------------------------------------- state
 export interface PlayerState {
   hp: number;
@@ -415,10 +377,16 @@ export interface RunState {
   seed: string;
   clock: number; // minutes since midnight; starts at 360 (06:00)
   player: PlayerState;
-  map: RunMap;
-  step: number; // index into map.steps
-  currentNodeId: NodeId | null;
-  visited: NodeId[];
+  /** the generated floor currently being explored */
+  floor: Floor;
+  depth: number;
+  px: number;
+  py: number;
+  bossId: EnemyId;
+  /** every floor entered this run, for the report */
+  floorsVisited: string[];
+  /** steps taken on the current floor */
+  floorSteps: number;
   npcTrust: Record<NpcId, number>;
   npcFlags: Record<string, string[]>;
   deadNpcs: NpcId[];
@@ -461,7 +429,8 @@ export interface SceneChoice {
 }
 
 export interface Scene {
-  nodeId: NodeId;
+  /** feature/npc uid, or a synthetic id for the surface scene */
+  nodeId: string;
   title: string;
   narrative: string;
   speaker?: NpcId;
@@ -508,4 +477,5 @@ export interface RunReport {
   nextRunUnlocks: string[];
   rewriteButtonLabel: string;
   endingReached?: EndingId;
+  deepestFloor: string;
 }

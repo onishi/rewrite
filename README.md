@@ -3,7 +3,11 @@
 > 死ぬと時間は巻き戻り、レベルも装備も失われる。残るのは、知ってしまったことだけだ。
 > ——そして、あなたが未来を書き換えた瞬間、その知識は嘘になる。
 
-生成AIをゲームシステムの中心ではなく **接着剤** として組み込んだ、ストーリー性のあるローグライク。
+生成AIをゲームシステムの中心ではなく **接着剤** として組み込んだ、
+ストーリー性のある **自動生成ダンジョンローグライク**。
+
+全 8 階層の迷宮は毎 Run 自動生成される。死ねば階層もレベルも装備も失われるが、
+**知ってしまったことだけは残る**。
 
 - 設計書: [`design/DESIGN.md`](design/DESIGN.md)
 - 設計自己レビュー: [`design/SELF_REVIEW.md`](design/SELF_REVIEW.md)
@@ -65,7 +69,7 @@ LLM 呼び出しだけを `/api/llm/*` 経由でサーバへ委譲します。�
 ### その他のコマンド
 
 ```bash
-npm test        # 59 テスト（戦闘 / Knowledge / REWRITE / LLM境界 / 自由行動 / 3Run検証）
+npm test        # 69 テスト（戦闘 / Knowledge / REWRITE / LLM境界 / 自由行動 / 3Run検証）
 npm run sim     # 3 Run の自動プレイ全文（設計 §22 の検証シナリオ）
 ```
 
@@ -100,11 +104,14 @@ packages/core/           ゲームエンジン（依存ゼロ・ブラウザで�
   src/rng.ts             シード付き決定論的乱数（Math.random は一切使わない）
   src/content/           Skill 20 / Synergy 11 / Knowledge 25 / Item 20 /
                          Enemy 7 / Boss 3 / NPC 5 / WorldTruth 10 / Rewrite 6
+  src/dungeon/
+    types.ts             フロア・タイル・エンティティ
+    generate.ts          フロア自動生成（部屋配置 → 通路 → 扉 → 役割 → 配置）
+    runtime.ts           視界・経路探索・移動・敵AI
   src/engine/
     combat.ts            ターン制戦闘（Intent / Feint / 状態異常 / Guard / Focus）
-    map.ts               ノードグラフ生成
     knowledge.ts         取得・信頼度・合成・無効化・効果解決
-    run.ts               時計・ノード解決・報酬・REWRITE 適用・RUN REPORT
+    run.ts               時計・探索・報酬・REWRITE 適用・RUN REPORT
     freeAction.ts        自由入力の判定（LLM は構造化のみ、判定はここ）
     game.ts              UI/サーバ共通のファサード
   src/llm/
@@ -112,7 +119,7 @@ packages/core/           ゲームエンジン（依存ゼロ・ブラウザで�
     mock.ts              Mock Provider（LLM なしで全機能が動く）
     anthropic.ts         Anthropic Provider（サーバ専用・全呼び出しに mock フォールバック）
     validate.ts          JSON Schema 検証・whitelist・文字数クランプ
-  test/                  59 テスト + 3 Run 自動シミュレータ
+  test/                  69 テスト + 3 Run 自動シミュレータ
 
   src/llm/proxy.ts       サーバ側 LLM ディスパッチ（Node と Worker で共有）
 
@@ -147,6 +154,14 @@ Trust / Suspicion / Distortion / 乱数
 - whitelist 外の consequence は無視される
 - **全呼び出しで例外を投げる敵対的 Provider を挿しても、HP が 1 も動かない**
 
+ダンジョン側にも不変条件のテストを置いています（`packages/core/test/dungeon.test.ts`）:
+
+- 全 8 階層 × 12 シードで、**到達できない床タイルが 1 つも存在しない**
+- 階段は必ず到達可能で、入口の真上には出ない
+- 同じシードは同じフロアを生成する
+- エンティティが壁の中や互いの上に生成されない
+- 部屋に入れば部屋全体が、通路では周囲 1 マスだけが見える
+
 ---
 
 ## AI が担当するもの
@@ -167,7 +182,11 @@ Trust / Suspicion / Distortion / 乱数
 
 | 要素 | 説明 |
 |---|---|
-| **時計** | 6:00 → 24:00。移動も寄り道も時間を食う。時間切れで消耗したまま Boss と対峙する |
+| **ダンジョン** | 全 8 階層。部屋と通路、扉、階段。毎 Run 自動生成 |
+| **視界** | 部屋に入るとその部屋全体が見える。通路は周囲 1 マス。松明で広がる |
+| **時計** | 6:00 → 24:00 = 約 1080 歩。全フロアを調べ尽くす余裕は絶対にない |
+| **灰** | 24:00 を過ぎると灰が降り、Guard を無視して毎分削られる |
+| **戦闘** | 敵に体当たりでバトル画面へ。**避けて通ることもできる** |
 | **Knowledge** | 文章ではなくルール。取得した瞬間に「何ができるようになったか」を提示する |
 | **信頼度** | Confirmed / Uncertain / Rumor / Invalidated。不確かな知識は発動しないことがある |
 | **合成** | 2 つの知識が揃うと自動で 3 つ目が生まれる（例: K005 + K006 → K021） |
@@ -175,6 +194,14 @@ Trust / Suspicion / Distortion / 乱数
 | **Distortion** | REWRITE のたびに増え、`schedule` タグの知識を一斉に不確かにする |
 | **死** | Knowledge は死んでも残る。Boss に負けると必ず 1 つ知識が手に入る |
 | **自由行動** | 1 Run に 3 回だけ。毎ターン入力を求めない |
+
+### 操作
+
+| | |
+|---|---|
+| 移動 | 方向キー / WASD / テンキー（8方向）/ マップをクリック |
+| 待つ | `5` `.` `Space` |
+| 足元を調べる | `Enter` |
 
 ### 「知識を集めるほど簡単になる」のを防ぐ 3 重の仕掛け
 

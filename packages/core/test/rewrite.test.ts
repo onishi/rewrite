@@ -16,10 +16,10 @@ test("RW03 swaps the boss and burns the Knowledge that enabled it", () => {
   const meta = newMeta();
   const run = startRun(meta, "rw3");
   grantKnowledge(meta, run, "K007");
-  assert.equal(run.map.bossId, "B_VANE");
+  assert.equal(run.bossId, "B_VANE");
   const res = applyRewrite(meta, run, "RW03");
 
-  assert.equal(run.map.bossId, "B_SELD", "the confrontation itself must change");
+  assert.equal(run.bossId, "B_SELD", "the confrontation itself must change");
   assert.ok(res.invalidated.includes("K007"), "the rewrite must consume its own premise");
   assert.equal(knows(meta, "K007"), false);
   assert.ok(meta.distortion >= 3);

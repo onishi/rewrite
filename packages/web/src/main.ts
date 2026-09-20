@@ -1,6 +1,6 @@
 import { Game } from "../../core/src/engine/game.js";
 import type { View, GameEvent, KnowledgeCard } from "../../core/src/engine/game.js";
-import type { MetaState, MapNode } from "../../core/src/types.js";
+import type { MetaState } from "../../core/src/types.js";
 import { newMeta } from "../../core/src/engine/run.js";
 import { detectProvider } from "./net.js";
 
@@ -137,7 +137,7 @@ function render(): void {
   const main = h("div");
   switch (view.screen) {
     case "scene": main.append(renderScene()); break;
-    case "map": main.append(renderMap()); break;
+    case "dungeon": main.append(renderDungeon()); break;
     case "combat": main.append(renderCombat()); break;
     case "reward": main.append(renderReward()); break;
   }
@@ -198,6 +198,7 @@ function renderTopbar(): HTMLElement {
     bar.append(s);
   };
   add("RUN", String(r.runNumber));
+  add("深度", `B${r.depth}F`);
   add("時刻", r.clock);
 
   const clockBar = h("div", "bar clock");
@@ -290,33 +291,122 @@ function renderFreeAction(): HTMLElement {
   return d;
 }
 
-function renderMap(): HTMLElement {
+const GLYPH_CLASS: Record<string, string> = {
+  "#": "wall", ".": "floor", "+": "door", ">": "stairs", "<": "stairs", " ": "dark",
+};
+
+const ENTITY_CLASS: Record<string, string> = {
+  e: "enemy", E: "elite", "Ω": "boss", "!": "lore", "▒": "ash", "◇": "chest",
+  "Ψ": "altar", "≡": "fire", $: "shop", "@": "npc", "(": "item", ">": "stairs", "≫": "stairs",
+};
+
+/**
+ * The floor, drawn from exactly the rows the engine says the player has seen.
+ * Nothing here decides anything — it is a view of `view.dungeon`.
+ */
+function renderDungeon(): HTMLElement {
   const p = h("div", "panel");
-  p.append(h("h2", "section", "どこへ向かう"));
-  const grid = h("div", "nodes");
-  for (const n of (view.options ?? []) as MapNode[]) {
-    const b = button("node", () => act(() => game.enter(n.id)));
-    b.append(h("div", "name", n.name));
-    const meta = h("div", "meta");
-    meta.append(h("span", undefined, KIND_JP[n.kind] ?? n.kind));
-    meta.append(h("span", "skulls", n.danger > 0 ? "◆".repeat(n.danger) : "安全"));
-    meta.append(h("span", undefined, `${n.timeCost / 60}h`));
-    b.append(meta);
-    const hints = h("div", "hints");
-    for (const t of n.hints) hints.append(h("span", "tag", t));
-    if (n.revealedByKnowledge) hints.append(h("span", "tag know", "Knowledge により出現"));
-    if (n.convertedBy) hints.append(h("span", "tag good", "Knowledge により戦闘回避"));
-    b.append(hints);
-    grid.append(b);
+  const d = view.dungeon!;
+  const head = h("div", "row");
+  head.append(h("h2", "section", `${d.title}`));
+  head.append(h("span", "tag", `探索 ${d.exploredPct}%`));
+  head.append(h("span", "tag", `深度 ${d.depth}/${d.maxDepth}`));
+  if (!d.stairsKnown) head.append(h("span", "tag", "階段は未発見"));
+  p.append(head);
+
+  const byPos = new Map<string, { glyph: string; name: string; kind: string }>();
+  for (const e of d.entities) byPos.set(`${e.x},${e.y}`, e);
+
+  const grid = h("div", "grid");
+  grid.style.setProperty("--cols", String(d.w));
+  const frag = document.createDocumentFragment();
+  for (let y = 0; y < d.h; y++) {
+    for (let x = 0; x < d.w; x++) {
+      const ch = d.rows[y]![x]!;
+      const lit = d.lit[y]![x]!;
+      const cell = document.createElement("i");
+      const isPlayer = x === d.player.x && y === d.player.y;
+      const ent = byPos.get(`${x},${y}`);
+      let glyph = ch;
+      let cls = GLYPH_CLASS[ch] ?? "dark";
+      if (ent && !isPlayer) { glyph = ent.glyph; cls = ENTITY_CLASS[ent.glyph] ?? "thing"; }
+      if (isPlayer) { glyph = "@"; cls = "you"; }
+      cell.className = `c ${cls}${lit === "1" ? " dim" : ""}`;
+      cell.textContent = glyph === " " ? "\u00a0" : glyph;
+      if (ent) cell.title = ent.name;
+      if (ch !== " " && ch !== "#") {
+        cell.addEventListener("click", () => { if (!busy) void act(() => game.travel(x, y)); });
+        cell.classList.add("walk");
+      }
+      frag.append(cell);
+    }
   }
+  grid.append(frag);
   p.append(grid);
+
+  p.append(renderDungeonControls(d));
+  p.append(renderLegend(d));
+  if (view.scene === undefined) p.append(renderFreeAction());
   return p;
 }
 
-const KIND_JP: Record<string, string> = {
-  combat: "戦闘", elite: "強敵", social: "会話", discovery: "発見", shop: "店",
-  shrine: "祭壇", rest: "休息", ashdoor: "灰の扉", boss: "対決", hub: "村",
-};
+function renderDungeonControls(d: NonNullable<View["dungeon"]>): HTMLElement {
+  const wrap = h("div", "controls");
+  const pad = h("div", "dpad");
+  const dirs: [string, number, number][] = [
+    ["↖", -1, -1], ["↑", 0, -1], ["↗", 1, -1],
+    ["←", -1, 0], ["·", 0, 0], ["→", 1, 0],
+    ["↙", -1, 1], ["↓", 0, 1], ["↘", 1, 1],
+  ];
+  for (const [label, dx, dy] of dirs) {
+    const b = button("pad", () => act(() => (dx === 0 && dy === 0) ? game.rest() : game.step(dx, dy)));
+    b.textContent = label;
+    b.title = dx === 0 && dy === 0 ? "その場で待つ（1分）" : "移動";
+    pad.append(b);
+  }
+  wrap.append(pad);
+
+  const side = h("div", "ctl-side");
+  const under = d.adjacent.find((a) => a.dx === 0 && a.dy === 0);
+  if (under) {
+    const b = button("choice", () => act(() => game.interact()));
+    b.textContent = `${under.glyph}  ${under.name} を調べる`;
+    side.append(b);
+  }
+  const foes = d.adjacent.filter((a) => a.kind === "enemy");
+  for (const f of foes) {
+    const b = button("choice danger", () => act(() => game.step(f.dx, f.dy)));
+    b.textContent = `⚔ ${f.name} に斬りかかる`;
+    side.append(b);
+  }
+  const others = d.adjacent.filter((a) => a.kind !== "enemy" && !(a.dx === 0 && a.dy === 0));
+  for (const o of others) {
+    const b = button("choice", () => act(() => game.step(o.dx, o.dy)));
+    b.textContent = `${o.glyph}  ${o.name}`;
+    side.append(b);
+  }
+  const waitB = button("choice", () => act(() => game.rest()));
+  waitB.textContent = "待つ（1分）";
+  side.append(waitB);
+  wrap.append(side);
+  return wrap;
+}
+
+function renderLegend(d: NonNullable<View["dungeon"]>): HTMLElement {
+  const l = h("div", "legend");
+  const items: [string, string][] = [
+    ["@", "あなた"], ["e", "敵"], ["E", "強敵"], [">", "下り階段"],
+    ["!", "手がかり"], ["▒", "灰の扉"], ["◇", "宝箱"], ["Ψ", "祭壇"],
+    ["≡", "篝火"], ["$", "商人"], ["@", "人物"], ["(", "道具"],
+  ];
+  for (const [g, name] of items) {
+    const s = h("span", "lg");
+    s.append(h("i", `c ${ENTITY_CLASS[g] ?? GLYPH_CLASS[g] ?? "floor"}`, g), h("span", undefined, name));
+    l.append(s);
+  }
+  l.append(h("span", "muted", "クリックで移動 / 方向キー・テンキー / 隣接で調べる"));
+  return l;
+}
 
 function renderCombat(): HTMLElement {
   const p = h("div", "panel");
@@ -519,6 +609,7 @@ function renderReport(): HTMLElement {
     d.append(h("span", "h", label), h("span", undefined, val || "—"));
     facts.append(d);
   };
+  line("到達深度", r.deepestFloor);
   line("初めて見た場所", r.firstSeen.join(" / "));
   line("倒したBoss", r.bossesDefeated.join(" / "));
   line("新しく判明した関係", r.relationshipsLearned.join(" / "));
@@ -588,11 +679,40 @@ function openCodex(): void {
   overlay.classList.remove("hidden");
 }
 
+// ------------------------------------------------------------------ keyboard
+const KEY_DIRS: Record<string, [number, number]> = {
+  ArrowUp: [0, -1], ArrowDown: [0, 1], ArrowLeft: [-1, 0], ArrowRight: [1, 0],
+  w: [0, -1], s: [0, 1], a: [-1, 0], d: [1, 0],
+  q: [-1, -1], e: [1, -1], z: [-1, 1], c: [1, 1],
+  8: [0, -1], 2: [0, 1], 4: [-1, 0], 6: [1, 0],
+  7: [-1, -1], 9: [1, -1], 1: [-1, 1], 3: [1, 1],
+};
+
+function installKeyboard(): void {
+  document.addEventListener("keydown", (ev) => {
+    if (busy) return;
+    if (!overlay.classList.contains("hidden")) return;
+    const target = ev.target as HTMLElement | null;
+    if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA")) return;
+    if (view?.screen !== "dungeon") return;
+
+    const dir = KEY_DIRS[ev.key];
+    if (dir) { ev.preventDefault(); void act(() => game.step(dir[0], dir[1])); return; }
+    if (ev.key === "5" || ev.key === "." || ev.key === " ") {
+      ev.preventDefault(); void act(() => game.rest()); return;
+    }
+    if (ev.key === "Enter" || ev.key === ">") {
+      ev.preventDefault(); void act(() => game.interact());
+    }
+  });
+}
+
 // ------------------------------------------------------------------ boot
 async function boot(): Promise<void> {
   const provider = await detectProvider();
   game = new Game(provider, loadMeta());
   view = game.view();
+  installKeyboard();
   render();
 }
 

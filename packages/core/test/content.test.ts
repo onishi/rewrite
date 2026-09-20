@@ -6,7 +6,7 @@ import { ITEMS, NPCS, WORLD_TRUTHS, ENDINGS } from "../src/content/world.js";
 import { ENEMIES, BOSSES, REWRITES } from "../src/content/enemies.js";
 import { Game, MockLLMProvider } from "../src/index.js";
 import { grantKnowledge } from "../src/engine/knowledge.js";
-import { startBoss, newMeta, startRun } from "../src/engine/run.js";
+import { checkTowerRoute, newMeta, startRun } from "../src/engine/run.js";
 
 test("the MVP content set matches the design", () => {
   assert.equal(SKILLS.length, 20, "20 skills");
@@ -67,8 +67,8 @@ test("every ending is reachable from the shipped content", async () => {
   const run = startRun(meta, "tower");
   grantKnowledge(meta, run, "K018");
   run.player.items.push("I_GRAVEKEY");
-  startBoss(meta, run);
-  assert.equal(run.map.bossId, "B_WRITER", "key + K018 must lead to the Writer");
+  assert.equal(checkTowerRoute(meta, run), true);
+  assert.equal(run.bossId, "B_WRITER", "key + K018 must lead to the Writer");
   assert.ok(BOSSES.find((b) => b.id === "B_WRITER"));
 });
 

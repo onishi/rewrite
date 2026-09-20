@@ -1,14 +1,16 @@
 import type {
-  MetaState, RunState, GameState, MapNode, Scene, RunReport, RewardOffer,
+  MetaState, RunState, GameState, Scene, RunReport, RewardOffer,
   SpecialAction, Reliability,
 } from "../types.js";
 import type { LLMProvider } from "../llm/provider.js";
 import { MockLLMProvider } from "../llm/mock.js";
 import {
-  newMeta, startRun, nodeOptions, enterNode, resolveChoice, takeReward,
-  doCombatAction, buildReport, availableRewrites, applyRewrite, currentNode,
-  clockString, onDeath, dejaVuStage, RUN_DEADLINE,
+  newMeta, startRun, resolveChoice, takeReward, move, travelTo, wait, descend, interactHere,
+  doCombatAction, buildReport, availableRewrites, applyRewrite, currentPlace,
+  clockString, onDeath, dejaVuStage, checkTowerRoute,
+  RUN_DEADLINE, RUN_START_CLOCK, DUNGEON_DEPTH,
 } from "./run.js";
+import { renderFloor } from "../dungeon/runtime.js";
 import { performFreeAction, buildWorldContext } from "./freeAction.js";
 import type { PlayerAction } from "./combat.js";
 import { SKILLS, getSkill, SYNERGIES, activeSynergies } from "../content/skills.js";
@@ -17,7 +19,7 @@ import { getKnowledge, KNOWLEDGE, nearSynthesis } from "../content/knowledge.js"
 import { getBoss } from "../content/enemies.js";
 import type { Acquisition } from "./knowledge.js";
 
-export type Screen = "title" | "scene" | "map" | "combat" | "reward" | "report";
+export type Screen = "title" | "scene" | "dungeon" | "combat" | "reward" | "report";
 
 export interface KnowledgeCard {
   id: string; title: string; description: string;
@@ -47,7 +49,7 @@ export interface View {
   };
   run?: {
     runNumber: number; clock: string; clockMinutes: number; deadline: number;
-    step: number; totalSteps: number;
+    depth: number; maxDepth: number; floorTitle: string;
     hp: number; maxHp: number; focus: number; maxFocus: number; guard: number;
     level: number; xp: number; gold: number; power: number;
     suspicion: number; freeActionsLeft: number;
@@ -60,7 +62,20 @@ export interface View {
     worldDeltas: string[];
     log: { clock: string; text: string; kind: string }[];
   };
-  options?: (MapNode & { locked?: boolean })[];
+  dungeon?: {
+    depth: number; maxDepth: number; title: string; region: string;
+    w: number; h: number;
+    /** one string per row; ' ' unknown, '#' wall, '.' floor, '+' door, '>' stairs */
+    rows: string[];
+    /** per-tile lit flag, same shape as rows */
+    lit: string[];
+    player: { x: number; y: number };
+    entities: { uid: string; x: number; y: number; glyph: string; kind: string; name: string }[];
+    exploredPct: number;
+    stairsKnown: boolean;
+    /** what the player is standing next to, for the action bar */
+    adjacent: { uid: string; glyph: string; name: string; kind: string; dx: number; dy: number }[];
+  };
   scene?: Scene & { rewrites?: { id: string; title: string; utterance: string; preview: string[] }[] };
   combat?: {
     turn: number;
@@ -80,6 +95,48 @@ export interface View {
   };
   report?: RunReport;
   events: GameEvent[];
+}
+
+function dungeonView(run: RunState): NonNullable<View["dungeon"]> {
+  const f = run.floor;
+  const { rows, entities } = renderFloor(f, run.px, run.py);
+  const lit: string[] = [];
+  let seenCount = 0, floorCount = 0;
+  for (let y = 0; y < f.h; y++) {
+    let row = "";
+    for (let x = 0; x < f.w; x++) {
+      const i = y * f.w + x;
+      row += f.visible[i] ? "2" : f.seen[i] ? "1" : "0";
+      if (f.tiles[i] !== "wall") {
+        floorCount++;
+        if (f.seen[i]) seenCount++;
+      }
+    }
+    lit.push(row);
+  }
+
+  const adjacent: NonNullable<View["dungeon"]>["adjacent"] = [];
+  for (let dy = -1; dy <= 1; dy++) {
+    for (let dx = -1; dx <= 1; dx++) {
+      if (dx === 0 && dy === 0) continue;
+      const e = f.entities.find((x) => x.x === run.px + dx && x.y === run.py + dy);
+      if (!e) continue;
+      adjacent.push({ uid: e.uid, glyph: e.glyph, name: e.name, kind: e.kind, dx, dy });
+    }
+  }
+  const here = f.entities.find((e) => e.x === run.px && e.y === run.py);
+  if (here) adjacent.push({ uid: here.uid, glyph: here.glyph, name: here.name, kind: here.kind, dx: 0, dy: 0 });
+
+  const place = currentPlace(run);
+  return {
+    depth: run.depth, maxDepth: DUNGEON_DEPTH, title: place.name, region: place.region,
+    w: f.w, h: f.h, rows, lit,
+    player: { x: run.px, y: run.py },
+    entities,
+    exploredPct: floorCount === 0 ? 0 : Math.round((seenCount / floorCount) * 100),
+    stairsKnown: f.seen[f.stairs.y * f.w + f.stairs.x] === 1,
+    adjacent,
+  };
 }
 
 const INTENT_LABEL: Record<string, string> = {
@@ -109,17 +166,37 @@ export class Game {
     return this.view();
   }
 
-  async enter(nodeId: string): Promise<View> {
+  /** One step in a compass direction. */
+  async step(dx: number, dy: number): Promise<View> {
+    return this.applyStep(() => move(this.state.meta, this.requireRun(), dx, dy), "step");
+  }
+
+  /** Walk to a tile, stopping at anything interesting. */
+  async travel(x: number, y: number): Promise<View> {
+    return this.applyStep(() => travelTo(this.state.meta, this.requireRun(), x, y), "travel");
+  }
+
+  async rest(): Promise<View> {
+    return this.applyStep(() => wait(this.state.meta, this.requireRun()), "wait");
+  }
+
+  /** Use the tile you are standing on (stairs, altar, chest, merchant...). */
+  async interact(): Promise<View> {
+    return this.applyStep(() => interactHere(this.state.meta, this.requireRun()), "interact");
+  }
+
+  private async applyStep(fn: () => { lines: string[]; acquisitions: Acquisition[]; combatStarted?: boolean; sceneOpened?: boolean; blocked?: boolean }, beat: string): Promise<View> {
     this.events = [];
     const run = this.requireRun();
-    const res = enterNode(this.state.meta, run, nodeId);
+    const res = fn();
     this.pushLines(res.lines);
     this.pushAcquisitions(res.acquisitions ?? []);
+    checkTowerRoute(this.state.meta, run);
     if (run.outcome !== "running") return this.toReport();
     if (res.combatStarted) this.screen = "combat";
     else if (run.pendingReward) this.screen = "reward";
-    else if (run.pendingScene) { this.screen = "scene"; await this.narrate("node_enter"); }
-    else this.screen = "map";
+    else if (res.sceneOpened && run.pendingScene) { this.screen = "scene"; await this.narrate(beat); }
+    else this.screen = "dungeon";
     return this.view();
   }
 
@@ -134,8 +211,9 @@ export class Game {
       await this.narrateRewrite(res.rewriteApplied);
     }
     if (run.outcome !== "running") return this.toReport();
+    checkTowerRoute(this.state.meta, run);
     if (run.pendingReward) this.screen = "reward";
-    else if (res.sceneClosed) this.screen = "map";
+    else if (res.sceneClosed) this.screen = "dungeon";
     return this.view();
   }
 
@@ -147,7 +225,7 @@ export class Game {
     this.pushLines(res.lines);
     this.pushAcquisitions(res.acquisitions ?? []);
     if (run.outcome !== "running") return this.toReport();
-    if (res.resolved) this.screen = run.pendingReward ? "reward" : "map";
+    if (res.resolved) this.screen = run.pendingReward ? "reward" : "dungeon";
     return this.view();
   }
 
@@ -157,8 +235,7 @@ export class Game {
     const lines = takeReward(this.state.meta, run, choice);
     this.pushLines(lines);
     for (const l of lines) if (l.startsWith("⚡")) this.events.push({ type: "synergy", text: l });
-    run.activeSynergies = activeSynergies(run.player.skills).map((s) => s.id);
-    this.screen = "map";
+    this.screen = "dungeon";
     return this.view();
   }
 
@@ -320,7 +397,7 @@ export class Game {
     if (run) {
       v.run = {
         runNumber: run.runNumber, clock: clockString(run.clock), clockMinutes: run.clock, deadline: RUN_DEADLINE,
-        step: run.step, totalSteps: run.map.steps.length - 1,
+        depth: run.depth, maxDepth: DUNGEON_DEPTH, floorTitle: currentPlace(run).name,
         hp: run.player.hp, maxHp: run.player.maxHp, focus: run.player.focus, maxFocus: run.player.maxFocus,
         guard: run.player.guard, level: run.player.level, xp: run.player.xp, gold: run.player.gold,
         power: run.player.power, suspicion: run.suspicion, freeActionsLeft: run.freeActionsLeft,
@@ -338,12 +415,12 @@ export class Game {
           const s = SYNERGIES.find((x) => x.id === id)!;
           return { id, jp: s.jp, desc: s.desc };
         }),
-        boss: getBoss(run.map.bossId).jp,
+        boss: getBoss(run.bossId).jp,
         worldDeltas: run.worldDeltas.map((d) => d.summary),
         log: run.log.slice(-24).map((l) => ({ clock: clockString(l.clock), text: l.text, kind: l.kind })),
       };
 
-      if (this.screen === "map") v.options = nodeOptions(run);
+      if (this.screen === "dungeon") v.dungeon = dungeonView(run);
       if (this.screen === "scene" && run.pendingScene) {
         v.scene = {
           ...run.pendingScene,

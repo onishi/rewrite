@@ -6,6 +6,7 @@ import {
 } from "../src/llm/validate.js";
 import { MockLLMProvider } from "../src/llm/mock.js";
 import { Game } from "../src/engine/game.js";
+import { playRun, type SimLog } from "./sim/auto-player.js";
 import type { LLMProvider } from "../src/llm/provider.js";
 
 /**
@@ -104,7 +105,7 @@ test("a provider that throws on every call cannot stop the game", async () => {
   assert.ok(v.run, "the run still starts");
   assert.equal(v.run!.hp, 70);
   v = await g.choose("VILLAGE_LEAVE");
-  assert.ok(["map", "scene"].includes(v.screen));
+  assert.ok(["dungeon", "scene"].includes(v.screen));
   const hp = g.state.run!.player.hp;
   assert.equal(hp, 70, "a failing LLM must not move a single hit point");
 });
@@ -122,22 +123,13 @@ test("the mock provider never emits numeric state", async () => {
 });
 
 test("the whole game is playable with the LLM switched off", async () => {
-  const g = new Game(new MockLLMProvider());
-  await g.startRun("offline");
-  let v = await g.choose("VILLAGE_LEAVE");
-  let steps = 0;
-  while (v.screen !== "report" && steps++ < 60) {
-    if (v.screen === "map") v = await g.enter((v.options ?? [])[0]!.id);
-    else if (v.screen === "scene") {
-      // pick a choice that closes the scene, the way a player eventually would
-      const cs = v.scene!.choices.filter((c) => !c.locked);
-      const exit = cs.find((c) => ["LEAVE", "VILLAGE_LEAVE", "DISC_TAKE", "REST_HEAL", "ASH_SKIP", "TALK"].includes(c.actionId));
-      v = await g.choose((exit ?? cs[cs.length - 1] ?? { actionId: "LEAVE" }).actionId);
-    }
-    else if (v.screen === "combat") v = await g.combat({ kind: "attack", targetUid: v.combat!.enemies[0]!.uid });
-    else if (v.screen === "reward") v = await g.reward(v.reward?.skills?.[0]?.id ?? null);
-    else break;
-  }
-  assert.ok(steps < 60, "the run must terminate");
-  assert.equal(g.provider.name, "mock");
+  const provider = new MockLLMProvider();
+  const g = new Game(provider);
+  const log: SimLog = { lines: [] };
+  const v = await playRun(g, "offline", "greedy-knowledge", log);
+
+  assert.equal(g.provider.name, "mock", "no network provider was involved");
+  assert.ok(v.report, "the run reached an ending without a single LLM call");
+  assert.ok(g.state.run!.floorsVisited.length >= 1, "floors were generated and explored");
+  assert.ok(log.lines.length > 10, "and there was an actual game to narrate");
 });
