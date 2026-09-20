@@ -5,9 +5,7 @@ import { fileURLToPath } from "node:url";
 import { MockLLMProvider } from "../../core/src/llm/mock.js";
 import { AnthropicProvider } from "../../core/src/llm/anthropic.js";
 import type { LLMProvider } from "../../core/src/llm/provider.js";
-import {
-  validateNarrative, validateInterpret, validateReaction, validateConsequence,
-} from "../../core/src/llm/validate.js";
+import { createLlmProxy, createRateLimiter } from "../../core/src/llm/proxy.js";
 
 /**
  * Thin LLM proxy + static host.
@@ -66,44 +64,8 @@ async function readBody(req: IncomingMessage, limit = 256 * 1024): Promise<unkno
   return JSON.parse(Buffer.concat(chunks).toString("utf8"));
 }
 
-/** Rate limit so a runaway client cannot burn the key. */
-const buckets = new Map<string, { n: number; reset: number }>();
-function allow(ip: string): boolean {
-  const now = Date.now();
-  const b = buckets.get(ip);
-  if (!b || now > b.reset) { buckets.set(ip, { n: 1, reset: now + 60_000 }); return true; }
-  b.n += 1;
-  return b.n <= 90;
-}
-
-async function handleLlm(method: string, payload: any): Promise<unknown> {
-  switch (method) {
-    case "generateNarrative": {
-      const r = await provider.generateNarrative(payload);
-      return validateNarrative(r);
-    }
-    case "interpretAction": {
-      const r = await provider.interpretAction(payload);
-      // Re-validate server side: the client's whitelist is never trusted alone.
-      return validateInterpret(
-        r,
-        (payload.knownTargets ?? []).map((t: { id: string }) => t.id),
-        (payload.knownInstruments ?? []).map((t: { id: string }) => t.id),
-        (payload.context?.knowledge ?? []).map((k: { id: string }) => k.id),
-      );
-    }
-    case "generateReaction": {
-      const r = await provider.generateReaction(payload);
-      return validateReaction(r, (payload.allowedActionIds ?? []).map((a: { id: string }) => a.id));
-    }
-    case "proposeConsequences": {
-      const r = await provider.proposeConsequences(payload);
-      return validateConsequence(r, (payload.allowedPrimitives ?? []).map((p: { id: string }) => p.id));
-    }
-    default:
-      throw new Error(`unknown method ${method}`);
-  }
-}
+const allow = createRateLimiter(90);
+const proxy = createLlmProxy(provider, (m, r) => console.warn(`[llm] ${m}: ${r}`));
 
 async function serveStatic(url: string, res: ServerResponse): Promise<boolean> {
   let rel = decodeURIComponent(url.split("?")[0]!);
@@ -142,14 +104,8 @@ const server = createServer(async (req, res) => {
       if (!allow(ip)) return json(res, 429, { error: "rate limited" });
       const method = url.slice("/api/llm/".length);
       const payload = await readBody(req);
-      try {
-        return json(res, 200, await handleLlm(method, payload));
-      } catch (e) {
-        // Never fail the client: hand back deterministic mock output instead.
-        console.warn(`[llm] ${method} failed: ${e}`);
-        const fallback = await handleLlmMock(method, payload);
-        return json(res, 200, fallback);
-      }
+      const out = await proxy.handle(method, payload);
+      return json(res, out.ok ? 200 : 400, out.body);
     }
     if (await serveStatic(url, res)) return;
     res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
@@ -159,16 +115,6 @@ const server = createServer(async (req, res) => {
     json(res, 500, { error: "internal" });
   }
 });
-
-async function handleLlmMock(method: string, payload: any): Promise<unknown> {
-  switch (method) {
-    case "generateNarrative": return mock.generateNarrative(payload);
-    case "interpretAction": return mock.interpretAction(payload);
-    case "generateReaction": return mock.generateReaction(payload);
-    case "proposeConsequences": return mock.proposeConsequences(payload);
-    default: return { error: "unknown method" };
-  }
-}
 
 server.listen(PORT, () => {
   console.log(`[rewrite] http://localhost:${PORT}`);

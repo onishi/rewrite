@@ -1,0 +1,19 @@
+name = "rewrite"
+main = "packages/worker/src/index.ts"
+compatibility_date = "2026-09-20"
+
+# The static bundle is assembled by tools/build-assets.mjs.
+# Assets are matched before the Worker runs, so only /api/* and unmatched
+# paths reach the handler.
+[assets]
+directory = "./build"
+binding = "ASSETS"
+
+[observability]
+enabled = true
+
+# The Anthropic key is a secret, never a var:
+#   npx wrangler secret put ANTHROPIC_API_KEY
+# Without it the Worker serves the mock provider and the game still runs.
+[vars]
+REWRITE_MODEL = "claude-sonnet-5"

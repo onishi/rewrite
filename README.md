@@ -25,6 +25,23 @@ LLM が担当するのは「事前に列挙しきれない物語上の変化」�
 
 ---
 
+## 公開先
+
+**https://rewrite.wagaya.workers.dev**
+
+Cloudflare Workers（静的アセット + LLM プロキシ）で動作しています。
+現在は `ANTHROPIC_API_KEY` が未設定のため **MOCK モード** です。
+ゲームの全機能はそのまま遊べます（物語文だけが決定論的テンプレートになります）。
+
+生成文を有効にする:
+
+```bash
+npx wrangler secret put ANTHROPIC_API_KEY    # 入力したキーはコードにも Git にも残らない
+npx wrangler deploy                          # 反映
+```
+
+---
+
 ## 動かす
 
 ```bash
@@ -43,7 +60,7 @@ ANTHROPIC_API_KEY=sk-... REWRITE_MODEL=claude-opus-5 npm start
 
 **API キーはブラウザに渡りません。** ゲームエンジンはブラウザ内で動作し、
 LLM 呼び出しだけを `/api/llm/*` 経由でサーバへ委譲します。キーはサーバプロセスの
-環境変数にのみ存在します。
+環境変数（Cloudflare では Worker のシークレット）にのみ存在します。
 
 ### その他のコマンド
 
@@ -51,6 +68,23 @@ LLM 呼び出しだけを `/api/llm/*` 経由でサーバへ委譲します。�
 npm test        # 59 テスト（戦闘 / Knowledge / REWRITE / LLM境界 / 自由行動 / 3Run検証）
 npm run sim     # 3 Run の自動プレイ全文（設計 §22 の検証シナリオ）
 ```
+
+### Cloudflare へのデプロイ
+
+```bash
+npm run cf:dev       # ローカルで Worker として起動（http://localhost:8787）
+npm run cf:deploy    # ビルド → アセット収集 → wrangler deploy
+npm run cf:secret    # ANTHROPIC_API_KEY を Worker のシークレットに登録
+```
+
+`npm run build:assets` が `build/` に公開バンドルを組み立てます（22 ファイル / 約 231 KB）。
+ページが参照するパスをそのまま保つ必要があるため、`packages/web/public/` と、
+コンパイル済みの `dist/web` `dist/core/src` だけをコピーします。
+サーバ・Worker・テストの出力は公開バンドルに入りません。
+
+Worker（`packages/worker/src/index.ts`）は Node 版サーバと同じ
+`packages/core/src/llm/proxy.ts` を共有しており、検証・whitelist・mock フォールバックの
+挙動は両者で完全に同一です。
 
 ---
 
@@ -80,8 +114,13 @@ packages/core/           ゲームエンジン（依存ゼロ・ブラウザで�
     validate.ts          JSON Schema 検証・whitelist・文字数クランプ
   test/                  59 テスト + 3 Run 自動シミュレータ
 
-packages/server/         LLM プロキシ + 静的配信（API キー保持はここだけ）
+  src/llm/proxy.ts       サーバ側 LLM ディスパッチ（Node と Worker で共有）
+
+packages/server/         ローカル開発用ホスト（node:http + 静的配信）
+packages/worker/         Cloudflare Worker ホスト（本番）
 packages/web/            UI（素の TypeScript + DOM、フレームワークなし）
+tools/build-assets.mjs   公開バンドルの組み立て
+wrangler.toml            Cloudflare 設定
 ```
 
 ---
