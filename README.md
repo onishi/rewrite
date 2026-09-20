@@ -1,0 +1,162 @@
+# REWRITE
+
+> 死ぬと時間は巻き戻り、レベルも装備も失われる。残るのは、知ってしまったことだけだ。
+> ——そして、あなたが未来を書き換えた瞬間、その知識は嘘になる。
+
+生成AIをゲームシステムの中心ではなく **接着剤** として組み込んだ、ストーリー性のあるローグライク。
+
+- 設計書: [`design/DESIGN.md`](design/DESIGN.md)
+- 設計自己レビュー: [`design/SELF_REVIEW.md`](design/SELF_REVIEW.md)
+
+---
+
+## 一番大事な性質
+
+**生成AIを完全に削除しても、ローグライクとして成立する。**
+
+戦闘・ビルド・シナジー・マップ・Knowledge・REWRITE・Boss 攻略・Ending 判定は
+すべてゲームエンジン内の決定論的なコードで、LLM は一切関与しません。
+
+```bash
+npm run sim     # LLM を 1 度も呼ばずに 3 Run を自動プレイし、全文を出力
+```
+
+LLM が担当するのは「事前に列挙しきれない物語上の変化」だけです。
+
+---
+
+## 動かす
+
+```bash
+npm install
+npm run build
+npm start                      # http://localhost:5173
+```
+
+API キーなしでそのまま遊べます（UI に `MOCK` バッジが出ます）。
+生成文を有効にする場合:
+
+```bash
+ANTHROPIC_API_KEY=sk-... npm start          # UI のバッジが AI になる
+ANTHROPIC_API_KEY=sk-... REWRITE_MODEL=claude-opus-5 npm start
+```
+
+**API キーはブラウザに渡りません。** ゲームエンジンはブラウザ内で動作し、
+LLM 呼び出しだけを `/api/llm/*` 経由でサーバへ委譲します。キーはサーバプロセスの
+環境変数にのみ存在します。
+
+### その他のコマンド
+
+```bash
+npm test        # 59 テスト（戦闘 / Knowledge / REWRITE / LLM境界 / 自由行動 / 3Run検証）
+npm run sim     # 3 Run の自動プレイ全文（設計 §22 の検証シナリオ）
+```
+
+---
+
+## 構成
+
+```
+design/
+  DESIGN.md              設計書（20項目）
+  SELF_REVIEW.md         自己レビューと、それによる設計修正
+
+packages/core/           ゲームエンジン（依存ゼロ・ブラウザでもNodeでも動く）
+  src/types.ts           データモデル
+  src/rng.ts             シード付き決定論的乱数（Math.random は一切使わない）
+  src/content/           Skill 20 / Synergy 11 / Knowledge 25 / Item 20 /
+                         Enemy 7 / Boss 3 / NPC 5 / WorldTruth 10 / Rewrite 6
+  src/engine/
+    combat.ts            ターン制戦闘（Intent / Feint / 状態異常 / Guard / Focus）
+    map.ts               ノードグラフ生成
+    knowledge.ts         取得・信頼度・合成・無効化・効果解決
+    run.ts               時計・ノード解決・報酬・REWRITE 適用・RUN REPORT
+    freeAction.ts        自由入力の判定（LLM は構造化のみ、判定はここ）
+    game.ts              UI/サーバ共通のファサード
+  src/llm/
+    provider.ts          LLM 抽象インターフェース
+    mock.ts              Mock Provider（LLM なしで全機能が動く）
+    anthropic.ts         Anthropic Provider（サーバ専用・全呼び出しに mock フォールバック）
+    validate.ts          JSON Schema 検証・whitelist・文字数クランプ
+  test/                  59 テスト + 3 Run 自動シミュレータ
+
+packages/server/         LLM プロキシ + 静的配信（API キー保持はここだけ）
+packages/web/            UI（素の TypeScript + DOM、フレームワークなし）
+```
+
+---
+
+## AI が触れないもの
+
+HP / ダメージ / 能力値 / アイテム / Gold / 時刻 / マップ / Knowledge 取得状態 /
+Skill / Status Effect / 敵の強さ / Drop / 成功判定 / Boss 条件 / Ending 条件 /
+Trust / Suspicion / Distortion / 乱数
+
+これを **3 層** で担保しています。
+
+1. **Schema** — LLM のレスポンス型に、意味のある数値フィールドが存在しない
+2. **Whitelist** — `proposeConsequences` はエンジンが渡した id からしか選べず、
+   大きさ（`low`/`mid`/`high`）の実数値はエンジン側で決まる
+3. **Sanitizer** — 検証に落ちた出力は Mock の決定論的テンプレートへ自動フォールバック
+
+> LLM が「あなたの攻撃でドラゴンは死んだ」と書いても、`enemy.hp` は 1 も減りません。
+
+テストで固定しています（`packages/core/test/llm-boundary.test.ts`）:
+
+- 存在しない target / instrument / Knowledge id は捨てられる
+- 発明された `actionId` は選択肢として採用されない
+- whitelist 外の consequence は無視される
+- **全呼び出しで例外を投げる敵対的 Provider を挿しても、HP が 1 も動かない**
+
+---
+
+## AI が担当するもの
+
+1. **列挙されていない逸脱の解釈**
+   「毒殺されることを知っているので、王の料理を犬に食べさせる」という入力を
+   `{verb:"give", target:"DOG", usesKnowledge:["K013"]}` に構造化する。
+   **判定はしない。** K013 を持っているか、城にいるか、犬がいるかはエンジンが確認する。
+2. **書き換えの余波の描写**
+   RW01 の連鎖（密会消滅 → 警戒 → 粛清イベント出現）はエンジンが決める。
+   「そのときハルガが何と言ったか」の組み合わせ爆発だけを AI が埋める。
+3. **記憶する NPC の言葉**
+   デジャヴ段階はエンジンが Run 数で決める。その段階で何と言うかを AI が書く。
+
+---
+
+## 遊び方の要点
+
+| 要素 | 説明 |
+|---|---|
+| **時計** | 6:00 → 24:00。移動も寄り道も時間を食う。時間切れで消耗したまま Boss と対峙する |
+| **Knowledge** | 文章ではなくルール。取得した瞬間に「何ができるようになったか」を提示する |
+| **信頼度** | Confirmed / Uncertain / Rumor / Invalidated。不確かな知識は発動しないことがある |
+| **合成** | 2 つの知識が揃うと自動で 3 つ目が生まれる（例: K005 + K006 → K021） |
+| **REWRITE** | 知識を使って未来を潰す。**必ずその知識が Invalidated になる** |
+| **Distortion** | REWRITE のたびに増え、`schedule` タグの知識を一斉に不確かにする |
+| **死** | Knowledge は死んでも残る。Boss に負けると必ず 1 つ知識が手に入る |
+| **自由行動** | 1 Run に 3 回だけ。毎ターン入力を求めない |
+
+### 「知識を集めるほど簡単になる」のを防ぐ 3 重の仕掛け
+
+1. REWRITE は必ず自分の前提を焼く（RW03 は K007 を焼き、`[偽物だと告げる]` が消える）
+2. Distortion の蓄積で時刻系の知識が一斉に劣化する
+3. Run 10 以降、騎士団長はループを記憶しており、**あなたが K004（火）を持っていることを知っている**
+
+### Ending 3 種
+
+| | 条件 |
+|---|---|
+| **E1 事件は解決した** | 騎士団長ヴェインを倒す |
+| **E2 陰謀は暴かれた** | 宰相セルドを倒す。ただし K007 か K022 を **無効化せずに** 保持していること |
+| **E3 REWRITE** | 灰の鍵と K018 を持って Boss に臨む。事件を解決せず、塔に登る |
+
+E2 は「知識を使って宰相を引きずり出す」と「知識を残しておく」が両立しないと成立しない。
+RW03 で宰相を表に出すと K007 が焼けるため、**同じ Run では E2 に届かない**。
+これは仕様であり、逆説の実演そのものです。
+
+---
+
+## ライセンス
+
+MIT
